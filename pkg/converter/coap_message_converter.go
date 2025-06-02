@@ -481,6 +481,20 @@ func (c *Converter) decompressGzip(payload []byte) ([]byte, error) {
 }
 
 func (c *Converter) decompressDeflate(payload []byte) ([]byte, error) {
-	// Implement deflate decompression if needed
-	return payload, fmt.Errorf("deflate decompression not implemented")
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("deflate payload is empty")
+	}
+
+	reader := bytes.NewReader(payload)
+	zlibReader, err := zlib.NewReader(reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create zlib reader: %w", err)
+	}
+	defer zlibReader.Close()
+
+	decompressed, err := io.ReadAll(zlibReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read decompressed data: %w", err)
+	}
+	return decompressed, nil
 }
