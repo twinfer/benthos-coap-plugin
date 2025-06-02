@@ -16,6 +16,7 @@ import (
 
 	"github.com/twinfer/benthos-coap-plugin/pkg/connection"
 	"github.com/twinfer/benthos-coap-plugin/pkg/converter"
+	"github.com/twinfer/benthos-coap-plugin/pkg/utils"
 )
 
 type Manager struct {
@@ -75,6 +76,7 @@ func NewManager(config Config, connManager *connection.Manager, converter *conve
 
 	bufferSize := config.BufferSize
 	if bufferSize == 0 {
+		logger.Debug("Using default buffer size for observer manager as config.BufferSize is 0")
 		bufferSize = 1000
 	}
 
@@ -101,9 +103,11 @@ func NewManager(config Config, connManager *connection.Manager, converter *conve
 }
 
 func (m *Manager) Start() error {
+	endpoints := m.connManager.Config().Endpoints
 	for _, path := range m.config.ObservePaths {
 		if err := m.Subscribe(path); err != nil {
-			m.logger.Errorf("Failed to subscribe to path %s: %v", path, err)
+			m.logger.Errorf("Failed to subscribe to path %s on endpoints %v: %v", path, endpoints, err)
+			// Decide if one failed subscription should stop others. Currently, it continues.
 			continue
 		}
 	}
@@ -114,13 +118,14 @@ func (m *Manager) Subscribe(path string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	endpoints := m.connManager.Config().Endpoints // Get endpoints for logging context
 	if _, exists := m.subscriptions[path]; exists {
-		return fmt.Errorf("already subscribed to path: %s", path)
+		return fmt.Errorf("already subscribed to path %s on endpoints %v", path, endpoints)
 	}
 
 	conn, err := m.connManager.Get(m.ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get connection: %w", err)
+		return fmt.Errorf("failed to get connection for path %s on endpoints %v: %w", path, endpoints, err)
 	}
 
 	circuit := NewCircuitBreaker(m.config.CircuitBreaker)
@@ -137,42 +142,60 @@ func (m *Manager) Subscribe(path string) error {
 	m.subscriptions[path] = subscription
 	m.wg.Add(1)
 
+	m.logger.Infof("Successfully subscribed to path %s on endpoint %s", path, sub.conn.Endpoint())
 	go m.observeWithRetry(subCtx, subscription)
 	return nil
 }
 
 func (m *Manager) observeWithRetry(ctx context.Context, sub *Subscription) {
 	defer m.wg.Done()
-	defer m.connManager.Put(sub.conn)
+	defer m.connManager.Put(sub.conn) // Ensure connection is returned to the pool
+
+	endpoint := sub.conn.Endpoint() // Get endpoint for logging context
 
 	for {
 		select {
 		case <-ctx.Done():
+			m.logger.Debugf("Observe context cancelled for path %s on endpoint %s", sub.path, endpoint)
 			return
 		default:
 		}
 
 		if !sub.circuit.CanExecute() {
-			m.logger.Debugf("Circuit breaker open, skipping observe for path: %s", sub.path)
-			time.Sleep(m.config.CircuitBreaker.Timeout)
-			continue
+			m.logger.Debugf("Circuit breaker open for path %s on endpoint %s, skipping observe. State: %s", sub.path, endpoint, sub.circuit.State())
+			m.metrics.CircuitBreakerOpen.Incr(1)
+			// Wait for circuit breaker timeout or context cancellation
+			select {
+			case <-time.After(sub.circuit.ResetInterval()): // Use circuit's reset interval
+				continue
+			case <-ctx.Done():
+				m.logger.Debugf("Observe context cancelled while circuit breaker was open for path %s on endpoint %s", sub.path, endpoint)
+				return
+			}
 		}
 
 		err := m.performObserve(ctx, sub)
 		if err != nil {
-			atomic.AddInt32(&sub.retryCount, 1)
+			currentRetryCount := atomic.AddInt32(&sub.retryCount, 1)
 			sub.circuit.RecordFailure()
 			m.metrics.ObservationsFailed.Incr(1)
 
-			m.logger.Warnf("Observe failed for path %s, retrying (count: %d): %v", sub.path, atomic.LoadInt32(&sub.retryCount), err)
+			m.logger.Warnf("Observe failed for path %s on endpoint %s (retry %d/%d): %v", sub.path, endpoint, currentRetryCount, m.config.RetryPolicy.MaxRetries, err)
 
-			if atomic.LoadInt32(&sub.retryCount) >= int32(m.config.RetryPolicy.MaxRetries) {
-				m.logger.Errorf("Max retries exceeded for observe on path: %s", sub.path)
+			if currentRetryCount >= int32(m.config.RetryPolicy.MaxRetries) {
+				m.logger.Errorf("Max retries (%d) exceeded for observe on path %s on endpoint %s. Marking as unhealthy.", m.config.RetryPolicy.MaxRetries, sub.path, endpoint)
 				atomic.StoreInt32(&sub.healthy, 0)
-				return
+				// Do not return immediately, let the loop check ctx.Done() or circuit breaker state
+				// This allows for potential recovery if the context is not done and circuit breaker eventually closes.
 			}
 
-			delay := m.calculateBackoff(int(atomic.LoadInt32(&sub.retryCount)))
+			backoffConfig := utils.BackoffConfig{
+				InitialInterval: m.config.RetryPolicy.InitialInterval,
+				MaxInterval:     m.config.RetryPolicy.MaxInterval,
+				Multiplier:      m.config.RetryPolicy.Multiplier,
+				Jitter:          m.config.RetryPolicy.Jitter,
+			}
+			delay := utils.CalculateBackoff(int(currentRetryCount), backoffConfig)
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
@@ -194,7 +217,7 @@ func (m *Manager) performObserve(ctx context.Context, sub *Subscription) error {
 	case *tcp.Conn:
 		coapConn = conn
 	default:
-		return fmt.Errorf("unsupported connection type")
+		return fmt.Errorf("unsupported connection type %T for path %s on endpoint %s", sub.conn.conn, sub.path, sub.conn.Endpoint())
 	}
 
 	observeCtx, cancel := context.WithTimeout(ctx, m.config.ObserveTimeout)
@@ -210,47 +233,80 @@ func (m *Manager) performObserve(ctx context.Context, sub *Subscription) error {
 	case *udp.Conn:
 		obs, err := conn.Observe(observeCtx, sub.path, handler)
 		if err != nil {
-			return fmt.Errorf("failed to start UDP observe: %w", err)
+			return fmt.Errorf("failed to start UDP observe for path %s on endpoint %s: %w", sub.path, sub.conn.Endpoint(), err)
 		}
+		// If we reach here, obs is valid.
+		m.metrics.ObservationsActive.Incr(1) // Increment active observations
+		defer func() {
+			m.logger.Debugf("Cancelling UDP observe for path %s on endpoint %s (token: %s) via defer", sub.path, sub.conn.Endpoint(), obs.Token())
+			cancelErr := obs.Cancel(context.Background()) // Use a new context for cancellation
+			if cancelErr != nil {
+				m.logger.Warnf("Error cancelling UDP observe (via defer) for path %s on endpoint %s: %v", sub.path, sub.conn.Endpoint(), cancelErr)
+			}
+			m.metrics.ObservationsActive.Decr(1) // Decrement active observations
+		}()
+
 		sub.observeToken = obs.Token()
-		m.metrics.ObservationsActive.Incr(1)
 		m.metrics.ObservationsTotal.Incr(1)
+		m.logger.Infof("UDP Observe started for path %s on endpoint %s with token %s", sub.path, sub.conn.Endpoint(), obs.Token())
 
 		// Wait for context cancellation or observe completion
 		<-observeCtx.Done()
-		obs.Cancel(context.Background())
+		m.logger.Debugf("UDP Observe context done for path %s on endpoint %s.", sub.path, sub.conn.Endpoint())
+		// Cancellation and metric decrementing are handled by defer.
 
 	case *tcp.Conn:
 		obs, err := conn.Observe(observeCtx, sub.path, handler)
 		if err != nil {
-			return fmt.Errorf("failed to start TCP observe: %w", err)
+			return fmt.Errorf("failed to start TCP observe for path %s on endpoint %s: %w", sub.path, sub.conn.Endpoint(), err)
 		}
+		// If we reach here, obs is valid.
+		m.metrics.ObservationsActive.Incr(1) // Increment active observations
+		defer func() {
+			m.logger.Debugf("Cancelling TCP observe for path %s on endpoint %s (token: %s) via defer", sub.path, sub.conn.Endpoint(), obs.Token())
+			cancelErr := obs.Cancel(context.Background()) // Use a new context for cancellation
+			if cancelErr != nil {
+				m.logger.Warnf("Error cancelling TCP observe (via defer) for path %s on endpoint %s: %v", sub.path, sub.conn.Endpoint(), cancelErr)
+			}
+			m.metrics.ObservationsActive.Decr(1) // Decrement active observations
+		}()
+
 		sub.observeToken = obs.Token()
-		m.metrics.ObservationsActive.Incr(1)
 		m.metrics.ObservationsTotal.Incr(1)
+		m.logger.Infof("TCP Observe started for path %s on endpoint %s with token %s", sub.path, sub.conn.Endpoint(), obs.Token())
 
 		// Wait for context cancellation or observe completion
 		<-observeCtx.Done()
-		obs.Cancel(context.Background())
+		m.logger.Debugf("TCP Observe context done for path %s on endpoint %s.", sub.path, sub.conn.Endpoint())
+		// Cancellation and metric decrementing are handled by defer.
 	}
 
+	// If the observe context was cancelled (e.g., timeout), return its error.
+	// Otherwise, if it completed without external cancellation, it might indicate an issue with the observation itself (e.g. server stopped sending).
+	if err := observeCtx.Err(); err != nil && err != context.Canceled {
+		return fmt.Errorf("observe operation ended for path %s on endpoint %s: %w", sub.path, sub.conn.Endpoint(), err)
+	}
 	return nil
 }
 
 func (m *Manager) handleObserveMessage(path string, coapMsg *mux.Message) {
 	sub := m.getSubscription(path)
 	if sub == nil {
-		m.logger.Warnf("Received message for unknown subscription: %s", path)
+		// This can happen if a message arrives after a subscription is cancelled/removed.
+		m.logger.Warnf("Received message for unknown or removed subscription path: %s. Token: %s", path, coapMsg.Token())
 		return
 	}
+	endpoint := sub.conn.Endpoint() // Get endpoint for logging context
 
 	sub.lastSeen = time.Now()
 	m.metrics.MessagesReceived.Incr(1)
+	atomic.StoreInt32(&sub.healthy, 1) // Mark as healthy on receiving a message
+	sub.circuit.RecordSuccess()      // Also record success in circuit breaker
 
 	// Convert CoAP message to Benthos message
 	msg, err := m.converter.CoAPToMessage(coapMsg.Message)
 	if err != nil {
-		m.logger.Errorf("Failed to convert CoAP message for path %s: %v", path, err)
+		m.logger.Errorf("Failed to convert CoAP message from path %s on endpoint %s: %v. Payload: %s", path, endpoint, err, string(coapMsg.Body()))
 		return
 	}
 
@@ -266,9 +322,9 @@ func (m *Manager) handleObserveMessage(path string, coapMsg *mux.Message) {
 
 	select {
 	case m.msgChan <- msg:
-		// Message queued successfully
+		m.logger.Debugf("Successfully queued message from path %s on endpoint %s. Token: %s", path, endpoint, coapMsg.Token())
 	default:
-		m.logger.Warnf("Message channel full, dropping message for path: %s", path)
+		m.logger.Warnf("Message channel full for observer manager (endpoints %v, paths %v), dropping message from path %s on endpoint %s. Token: %s", m.connManager.Config().Endpoints, m.config.ObservePaths, path, endpoint, coapMsg.Token())
 	}
 }
 
@@ -278,41 +334,32 @@ func (m *Manager) getSubscription(path string) *Subscription {
 	return m.subscriptions[path]
 }
 
-func (m *Manager) calculateBackoff(retryCount int) time.Duration {
-	delay := float64(m.config.RetryPolicy.InitialInterval)
-
-	for i := 0; i < retryCount; i++ {
-		delay *= m.config.RetryPolicy.Multiplier
-	}
-
-	if time.Duration(delay) > m.config.RetryPolicy.MaxInterval {
-		delay = float64(m.config.RetryPolicy.MaxInterval)
-	}
-
-	if m.config.RetryPolicy.Jitter {
-		// Add up to 25% jitter
-		jitter := delay * 0.25 * (2*float64(time.Now().UnixNano()%100)/100 - 1)
-		delay += jitter
-	}
-
-	return time.Duration(delay)
-}
-
 func (m *Manager) MessageChan() <-chan *service.Message {
 	return m.msgChan
 }
 
 func (m *Manager) Close() error {
-	m.cancel()
+	m.logger.Info("Closing observer manager...")
+	m.cancel() // Signal all observeWithRetry goroutines to stop
 
-	m.mu.Lock()
+	m.mu.Lock() // Ensure exclusive access to subscriptions map
+	m.logger.Debugf("Cancelling %d active subscriptions...", len(m.subscriptions))
 	for path, sub := range m.subscriptions {
-		sub.cancel()
-		m.logger.Debug(fmt.Sprintf("Cancelled subscription for path: %s", path))
+		endpoint := "unknown"
+		if sub.conn != nil { // Connection might be nil if subscription failed early
+			endpoint = sub.conn.Endpoint()
+		}
+		sub.cancel() // Cancel the context for this specific subscription
+		m.logger.Debugf("Cancelled subscription for path %s on endpoint %s", path, endpoint)
 	}
 	m.mu.Unlock()
 
-	m.wg.Wait()
+	m.logger.Debug("Waiting for all observer goroutines to complete...")
+	m.wg.Wait() // Wait for all observeWithRetry goroutines to finish
+	m.logger.Debug("All observer goroutines completed.")
+
+	close(m.msgChan)
+	m.logger.Info("Observer manager closed.")
 	close(m.msgChan)
 
 	return nil
@@ -338,8 +385,14 @@ func (m *Manager) HealthStatus() map[string]interface{} {
 			healthyCount++
 		}
 	}
+	endpoints := []string{}
+	if m.connManager != nil && m.connManager.Config().Endpoints != nil {
+		endpoints = m.connManager.Config().Endpoints
+	}
 
 	status["summary"] = map[string]interface{}{
+		"endpoints":             endpoints,
+		"observe_paths":         m.config.ObservePaths,
 		"total_subscriptions":   len(m.subscriptions),
 		"healthy_subscriptions": healthyCount,
 		"buffer_usage":          fmt.Sprintf("%d/%d", len(m.msgChan), cap(m.msgChan)),

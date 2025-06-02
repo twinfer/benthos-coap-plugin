@@ -146,6 +146,7 @@ type Input struct {
 	closeOnce sync.Once
 	closed    bool
 	mu        sync.RWMutex
+	wg        sync.WaitGroup
 }
 
 type Metrics struct {
@@ -174,130 +175,40 @@ func newCoAPInput(conf *service.ParsedConfig, mgr *service.Resources) (*Input, e
 	}
 
 	// Parse security config
-	securityConf, err := conf.FieldObjectMap("security")
+	security, err := parseSecurityConfig(conf)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse security config: %w", err)
+		return nil, err // Error already has context from parseSecurityConfig
 	}
 
-	securityMode := securityConf["mode"].(string)
-	security := connection.SecurityConfig{
-		Mode: securityMode,
-	}
-
-	if securityMode == "psk" {
-		if identity, exists := securityConf["psk_identity"]; exists {
-			security.PSKIdentity = identity.(string)
-		}
-		if key, exists := securityConf["psk_key"]; exists {
-			security.PSKKey = key.(string)
-		}
-	} else if securityMode == "certificate" {
-		if certFile, exists := securityConf["cert_file"]; exists {
-			security.CertFile = certFile.(string)
-		}
-		if keyFile, exists := securityConf["key_file"]; exists {
-			security.KeyFile = keyFile.(string)
-		}
-		if caCertFile, exists := securityConf["ca_cert_file"]; exists {
-			security.CACertFile = caCertFile.(string)
-		}
-		if insecureSkip, exists := securityConf["insecure_skip_verify"]; exists {
-			security.InsecureSkip = insecureSkip.(bool)
-		}
-	}
-
-	// Parse connection pool config
-	poolConf, err := conf.FieldObjectMap("connection_pool")
+	// Parse connection config (includes pool settings)
+	connConfig, err := parseConnectionConfig(conf, endpoints, protocol, security)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse connection_pool config: %w", err)
+		return nil, err
 	}
 
-	maxSize := poolConf["max_size"].(int)
-	idleTimeout := poolConf["idle_timeout"].(time.Duration)
-	healthCheckInterval := poolConf["health_check_interval"].(time.Duration)
-	connectTimeout := poolConf["connect_timeout"].(time.Duration)
-
-	// Parse observer config
-	obsConf, err := conf.FieldObjectMap("observer")
+	// Parse observer config (includes retry and circuit breaker)
+	obsConfig, err := parseObserverConfig(conf, observePaths)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse observer config: %w", err)
-	}
-
-	bufferSize := obsConf["buffer_size"].(int)
-	observeTimeout := obsConf["observe_timeout"].(time.Duration)
-	resubscribeDelay := obsConf["resubscribe_delay"].(time.Duration)
-
-	// Parse retry policy
-	retryConf, err := conf.FieldObjectMap("retry_policy")
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse retry_policy config: %w", err)
-	}
-
-	retryPolicy := observer.RetryPolicy{
-		MaxRetries:      retryConf["max_retries"].(int),
-		InitialInterval: retryConf["initial_interval"].(time.Duration),
-		MaxInterval:     retryConf["max_interval"].(time.Duration),
-		Multiplier:      retryConf["multiplier"].(float64),
-		Jitter:          retryConf["jitter"].(bool),
-	}
-
-	// Parse circuit breaker config
-	cbConf, err := conf.FieldObjectMap("circuit_breaker")
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse circuit_breaker config: %w", err)
-	}
-
-	circuitConfig := observer.CircuitConfig{
-		Enabled:          cbConf["enabled"].(bool),
-		FailureThreshold: cbConf["failure_threshold"].(int),
-		SuccessThreshold: cbConf["success_threshold"].(int),
-		Timeout:          cbConf["timeout"].(time.Duration),
-		HalfOpenMaxCalls: cbConf["half_open_max_calls"].(int),
+		return nil, err
 	}
 
 	// Parse converter config
-	convConf, err := conf.FieldObjectMap("converter")
+	converterConfig, err := parseConverterConfig(conf)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse converter config: %w", err)
-	}
-
-	converterConfig := converter.Config{
-		DefaultContentFormat: convConf["default_content_format"].(string),
-		CompressionEnabled:   convConf["compression_enabled"].(bool),
-		MaxPayloadSize:       convConf["max_payload_size"].(int),
-		PreserveOptions:      convConf["preserve_options"].(bool),
+		return nil, err
 	}
 
 	// Initialize components
-	connConfig := connection.Config{
-		Endpoints:           endpoints,
-		Protocol:            protocol,
-		MaxPoolSize:         maxSize,
-		IdleTimeout:         idleTimeout,
-		HealthCheckInterval: healthCheckInterval,
-		ConnectTimeout:      connectTimeout,
-		Security:            security,
-	}
-
 	connManager, err := connection.NewManager(connConfig, mgr.Logger(), mgr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create connection manager: %w", err)
+		return nil, fmt.Errorf("failed to create connection manager for endpoints %v: %w", connConfig.Endpoints, err)
 	}
 
 	conv := converter.NewConverter(converterConfig, mgr.Logger())
 
-	obsConfig := observer.Config{
-		ObservePaths:     observePaths,
-		RetryPolicy:      retryPolicy,
-		CircuitBreaker:   circuitConfig,
-		BufferSize:       bufferSize,
-		ObserveTimeout:   observeTimeout,
-		ResubscribeDelay: resubscribeDelay,
-	}
-
 	obsManager, err := observer.NewManager(obsConfig, connManager, conv, mgr.Logger(), mgr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create observer manager: %w", err)
+		return nil, fmt.Errorf("failed to create observer manager for paths %v: %w", obsConfig.ObservePaths, err)
 	}
 
 	input := &Input{
@@ -319,6 +230,191 @@ func newCoAPInput(conf *service.ParsedConfig, mgr *service.Resources) (*Input, e
 	return input, nil
 }
 
+func parseSecurityConfig(conf *service.ParsedConfig) (connection.SecurityConfig, error) {
+	securityMode, err := conf.FieldString("security", "mode")
+	if err != nil {
+		return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.mode: %w", err)
+	}
+	security := connection.SecurityConfig{
+		Mode: securityMode,
+	}
+
+	if securityMode == "psk" {
+		if conf.ContainsPath("security", "psk_identity") {
+			security.PSKIdentity, err = conf.FieldString("security", "psk_identity")
+			if err != nil {
+				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.psk_identity: %w", err)
+			}
+		}
+		if conf.ContainsPath("security", "psk_key") {
+			security.PSKKey, err = conf.FieldString("security", "psk_key")
+			if err != nil {
+				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.psk_key: %w", err)
+			}
+		}
+	} else if securityMode == "certificate" {
+		if conf.ContainsPath("security", "cert_file") {
+			security.CertFile, err = conf.FieldString("security", "cert_file")
+			if err != nil {
+				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.cert_file: %w", err)
+			}
+		}
+		if conf.ContainsPath("security", "key_file") {
+			security.KeyFile, err = conf.FieldString("security", "key_file")
+			if err != nil {
+				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.key_file: %w", err)
+			}
+		}
+		if conf.ContainsPath("security", "ca_cert_file") {
+			security.CACertFile, err = conf.FieldString("security", "ca_cert_file")
+			if err != nil {
+				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.ca_cert_file: %w", err)
+			}
+		}
+		security.InsecureSkip, err = conf.FieldBool("security", "insecure_skip_verify")
+		if err != nil {
+			return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.insecure_skip_verify: %w", err)
+		}
+	}
+	return security, nil
+}
+
+func parseConnectionConfig(conf *service.ParsedConfig, endpoints []string, protocol string, securityCfg connection.SecurityConfig) (connection.Config, error) {
+	maxSize, err := conf.FieldInt("connection_pool", "max_size")
+	if err != nil {
+		return connection.Config{}, fmt.Errorf("failed to parse connection_pool.max_size: %w", err)
+	}
+	idleTimeout, err := conf.FieldDuration("connection_pool", "idle_timeout")
+	if err != nil {
+		return connection.Config{}, fmt.Errorf("failed to parse connection_pool.idle_timeout: %w", err)
+	}
+	healthCheckInterval, err := conf.FieldDuration("connection_pool", "health_check_interval")
+	if err != nil {
+		return connection.Config{}, fmt.Errorf("failed to parse connection_pool.health_check_interval: %w", err)
+	}
+	connectTimeout, err := conf.FieldDuration("connection_pool", "connect_timeout")
+	if err != nil {
+		return connection.Config{}, fmt.Errorf("failed to parse connection_pool.connect_timeout: %w", err)
+	}
+
+	return connection.Config{
+		Endpoints:           endpoints,
+		Protocol:            protocol,
+		MaxPoolSize:         maxSize,
+		IdleTimeout:         idleTimeout,
+		HealthCheckInterval: healthCheckInterval,
+		ConnectTimeout:      connectTimeout,
+		Security:            securityCfg,
+	}, nil
+}
+
+func parseObserverConfig(conf *service.ParsedConfig, observePaths []string) (observer.Config, error) {
+	bufferSize, err := conf.FieldInt("observer", "buffer_size")
+	if err != nil {
+		return observer.Config{}, fmt.Errorf("failed to parse observer.buffer_size: %w", err)
+	}
+	observeTimeout, err := conf.FieldDuration("observer", "observe_timeout")
+	if err != nil {
+		return observer.Config{}, fmt.Errorf("failed to parse observer.observe_timeout: %w", err)
+	}
+	resubscribeDelay, err := conf.FieldDuration("observer", "resubscribe_delay")
+	if err != nil {
+		return observer.Config{}, fmt.Errorf("failed to parse observer.resubscribe_delay: %w", err)
+	}
+
+	// Parse retry policy
+	maxRetries, err := conf.FieldInt("retry_policy", "max_retries")
+	if err != nil {
+		return observer.Config{}, fmt.Errorf("failed to parse retry_policy.max_retries: %w", err)
+	}
+	initialInterval, err := conf.FieldDuration("retry_policy", "initial_interval")
+	if err != nil {
+		return observer.Config{}, fmt.Errorf("failed to parse retry_policy.initial_interval: %w", err)
+	}
+	maxInterval, err := conf.FieldDuration("retry_policy", "max_interval")
+	if err != nil {
+		return observer.Config{}, fmt.Errorf("failed to parse retry_policy.max_interval: %w", err)
+	}
+	multiplier, err := conf.FieldFloat("retry_policy", "multiplier")
+	if err != nil {
+		return observer.Config{}, fmt.Errorf("failed to parse retry_policy.multiplier: %w", err)
+	}
+	jitter, err := conf.FieldBool("retry_policy", "jitter")
+	if err != nil {
+		return observer.Config{}, fmt.Errorf("failed to parse retry_policy.jitter: %w", err)
+	}
+	retryPolicy := observer.RetryPolicy{
+		MaxRetries:      maxRetries,
+		InitialInterval: initialInterval,
+		MaxInterval:     maxInterval,
+		Multiplier:      multiplier,
+		Jitter:          jitter,
+	}
+
+	// Parse circuit breaker config
+	cbEnabled, err := conf.FieldBool("circuit_breaker", "enabled")
+	if err != nil {
+		return observer.Config{}, fmt.Errorf("failed to parse circuit_breaker.enabled: %w", err)
+	}
+	cbFailureThreshold, err := conf.FieldInt("circuit_breaker", "failure_threshold")
+	if err != nil {
+		return observer.Config{}, fmt.Errorf("failed to parse circuit_breaker.failure_threshold: %w", err)
+	}
+	cbSuccessThreshold, err := conf.FieldInt("circuit_breaker", "success_threshold")
+	if err != nil {
+		return observer.Config{}, fmt.Errorf("failed to parse circuit_breaker.success_threshold: %w", err)
+	}
+	cbTimeout, err := conf.FieldDuration("circuit_breaker", "timeout")
+	if err != nil {
+		return observer.Config{}, fmt.Errorf("failed to parse circuit_breaker.timeout: %w", err)
+	}
+	cbHalfOpenMaxCalls, err := conf.FieldInt("circuit_breaker", "half_open_max_calls")
+	if err != nil {
+		return observer.Config{}, fmt.Errorf("failed to parse circuit_breaker.half_open_max_calls: %w", err)
+	}
+	circuitConfig := observer.CircuitConfig{
+		Enabled:          cbEnabled,
+		FailureThreshold: cbFailureThreshold,
+		SuccessThreshold: cbSuccessThreshold,
+		Timeout:          cbTimeout,
+		HalfOpenMaxCalls: cbHalfOpenMaxCalls,
+	}
+
+	return observer.Config{
+		ObservePaths:     observePaths,
+		RetryPolicy:      retryPolicy,
+		CircuitBreaker:   circuitConfig,
+		BufferSize:       bufferSize,
+		ObserveTimeout:   observeTimeout,
+		ResubscribeDelay: resubscribeDelay,
+	}, nil
+}
+
+func parseConverterConfig(conf *service.ParsedConfig) (converter.Config, error) {
+	defaultContentFormat, err := conf.FieldString("converter", "default_content_format")
+	if err != nil {
+		return converter.Config{}, fmt.Errorf("failed to parse converter.default_content_format: %w", err)
+	}
+	compressionEnabled, err := conf.FieldBool("converter", "compression_enabled")
+	if err != nil {
+		return converter.Config{}, fmt.Errorf("failed to parse converter.compression_enabled: %w", err)
+	}
+	maxPayloadSize, err := conf.FieldInt("converter", "max_payload_size")
+	if err != nil {
+		return converter.Config{}, fmt.Errorf("failed to parse converter.max_payload_size: %w", err)
+	}
+	preserveOptions, err := conf.FieldBool("converter", "preserve_options")
+	if err != nil {
+		return converter.Config{}, fmt.Errorf("failed to parse converter.preserve_options: %w", err)
+	}
+	return converter.Config{
+		DefaultContentFormat: defaultContentFormat,
+		CompressionEnabled:   compressionEnabled,
+		MaxPayloadSize:       maxPayloadSize,
+		PreserveOptions:      preserveOptions,
+	}, nil
+}
+
 func (i *Input) Connect(ctx context.Context) error {
 	i.mu.RLock()
 	if i.closed {
@@ -330,11 +426,14 @@ func (i *Input) Connect(ctx context.Context) error {
 	i.logger.Info(fmt.Sprintf("Starting CoAP input with endpoints: %v", i.connManager.Config().Endpoints))
 
 	// Start observer manager
+	i.logger.Info(fmt.Sprintf("Attempting to start observer manager for endpoints: %v, paths: %v", i.connManager.Config().Endpoints, i.obsManager.Config().ObservePaths))
 	if err := i.obsManager.Start(); err != nil {
+		i.logger.Error(fmt.Sprintf("Failed to start observer manager for endpoints %v, paths %v: %v", i.connManager.Config().Endpoints, i.obsManager.Config().ObservePaths, err))
 		return fmt.Errorf("failed to start observer manager: %w", err)
 	}
 
 	// Start message forwarding goroutine
+	i.wg.Add(1)
 	go i.forwardMessages()
 
 	i.logger.Info("CoAP input connected successfully")
@@ -342,9 +441,11 @@ func (i *Input) Connect(ctx context.Context) error {
 }
 
 func (i *Input) forwardMessages() {
+	defer i.wg.Done() // Signal that this goroutine has finished when it exits
 	defer func() {
 		if r := recover(); r != nil {
-			i.logger.Error(fmt.Sprintf("Message forwarding panic: %v", r))
+			i.logger.Error(fmt.Sprintf("Message forwarding panic in CoAP input for endpoints %v: %v", i.connManager.Config().Endpoints, r))
+			// Optionally, re-panic if you want the process to crash, or handle more gracefully
 		}
 	}()
 
@@ -352,19 +453,27 @@ func (i *Input) forwardMessages() {
 		select {
 		case msg, ok := <-i.obsManager.MessageChan():
 			if !ok {
-				i.logger.Debug("Observer message channel closed")
+				i.logger.Debug(fmt.Sprintf("Observer message channel closed for CoAP input with endpoints: %v. Exiting forwardMessages.", i.connManager.Config().Endpoints))
 				return
 			}
+
+			// Attempt to add metadata about the source of the message if possible
+			// This depends on how messages are structured by the observer.
+			// For example, if msg.MetaGet("coap_path") exists:
+			// sourcePath, _ := msg.MetaGet("coap_path")
 
 			select {
 			case i.msgChan <- msg:
 				i.metrics.MessagesRead.Incr(1)
 			default:
-				i.logger.Warn("Message buffer full, dropping message")
+				// Add more context to the log message
+				observePaths := i.obsManager.Config().ObservePaths
+				i.logger.Warn(fmt.Sprintf("Message buffer full for CoAP input, dropping message. Endpoints: %v, Observe Paths: %v", i.connManager.Config().Endpoints, observePaths))
 				i.metrics.MessagesDropped.Incr(1)
 			}
 
 		case <-i.closeChan:
+			i.logger.Debug(fmt.Sprintf("closeChan received in forwardMessages for CoAP input with endpoints: %v. Exiting.", i.connManager.Config().Endpoints))
 			return
 		}
 	}
@@ -383,7 +492,14 @@ func (i *Input) Read(ctx context.Context) (*service.Message, service.AckFunc, er
 	case msg := <-i.msgChan:
 		return msg, func(ctx context.Context, err error) error {
 			if err != nil {
-				i.logger.Error(fmt.Sprintf("Message processing failed: %v", err))
+				// Attempt to get message metadata for logging
+				var msgDetails string
+				if mStr, mErr := msg.AsBytes(); mErr == nil {
+					msgDetails = fmt.Sprintf("Message ID: %s, Content snippet: %s", msg.ID(), string(mStr[:min(20, len(mStr))]))
+				} else {
+					msgDetails = fmt.Sprintf("Message ID: %s (content not available)", msg.ID())
+				}
+				i.logger.Error(fmt.Sprintf("Message processing failed for CoAP input. Endpoints: %v. Details: %s. Error: %v", i.connManager.Config().Endpoints, msgDetails, err))
 				i.metrics.ErrorsTotal.Incr(1)
 			}
 			return nil
@@ -408,21 +524,37 @@ func (i *Input) Close(ctx context.Context) error {
 		i.logger.Info("Closing CoAP input")
 
 		// Close observer manager
+		i.logger.Debug(fmt.Sprintf("Closing observer manager for CoAP input with endpoints: %v, paths: %v", i.connManager.Config().Endpoints, i.obsManager.Config().ObservePaths))
 		if err := i.obsManager.Close(); err != nil {
-			i.logger.Error(fmt.Sprintf("Failed to close observer manager: %v", err))
+			i.logger.Error(fmt.Sprintf("Failed to close observer manager for CoAP input with endpoints %v, paths %v: %v", i.connManager.Config().Endpoints, i.obsManager.Config().ObservePaths, err))
 		}
 
 		// Close connection manager
-		if err := i.connManager.Close(); err != nil {
-			i.logger.Error(fmt.Sprintf("Failed to close connection  manager: %v", err))
+		i.logger.Debug(fmt.Sprintf("Closing connection manager for CoAP input with endpoints: %v", i.connManager.Config().Endpoints))
+		if i.connManager != nil {
+			if err := i.connManager.Close(); err != nil {
+				i.logger.Error(fmt.Sprintf("Failed to close connection manager for CoAP input with endpoints %v: %v", i.connManager.Config().Endpoints, err))
+			}
 		}
 
-		// Drain remaining messages
-		go func() {
-			for range i.msgChan {
-				// Drain channel
-			}
-		}()
+		// Wait for forwardMessages goroutine to finish.
+		// This ensures that no more messages will be written to i.msgChan.
+		i.logger.Debug("Waiting for forwardMessages goroutine to stop...")
+		i.wg.Wait()
+		i.logger.Debug("forwardMessages goroutine stopped.")
+
+		// Now it's safe to close i.msgChan as there are no more writers.
+		// The Read method will stop due to i.closeChan.
+		// Any messages already in i.msgChan will be processed by Read calls
+		// that were initiated before i.closeChan was processed by them,
+		// or they will be drained if Benthos stops calling Read.
+		// Explicitly closing msgChan is good practice if there were other consumers or complex scenarios.
+		// However, given Benthos's Read loop and our handling of i.closeChan in Read,
+		// the explicit draining goroutine might have been redundant if msgChan was closed.
+		// Let's ensure it's closed to prevent any theoretical leaks with the old draining goroutine.
+		// But we'll remove the old draining goroutine.
+		close(i.msgChan)
+		i.logger.Debug("Closed input msgChan.")
 
 		i.logger.Info("CoAP input closed")
 	})
@@ -442,8 +574,10 @@ func (i *Input) Health() map[string]interface{} {
 	}
 
 	status := map[string]interface{}{
-		"status":       "healthy",
-		"buffer_usage": fmt.Sprintf("%d/%d", len(i.msgChan), cap(i.msgChan)),
+		"status":        "healthy",
+		"buffer_usage":  fmt.Sprintf("%d/%d", len(i.msgChan), cap(i.msgChan)),
+		"endpoints":     i.connManager.Config().Endpoints,
+		"observe_paths": i.obsManager.Config().ObservePaths,
 	}
 
 	if i.obsManager != nil {
@@ -451,4 +585,11 @@ func (i *Input) Health() map[string]interface{} {
 	}
 
 	return status
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

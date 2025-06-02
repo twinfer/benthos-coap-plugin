@@ -14,6 +14,7 @@ import (
 
 	"github.com/twinfer/benthos-coap-plugin/pkg/connection"
 	"github.com/twinfer/benthos-coap-plugin/pkg/converter"
+	"github.com/twinfer/benthos-coap-plugin/pkg/utils"
 )
 
 func init() {
@@ -187,101 +188,39 @@ func newCoAPOutput(conf *service.ParsedConfig, mgr *service.Resources) (*Output,
 	}
 
 	// Parse security config
-	securityConf, err := conf.FieldObjectMap("security")
+	security, err := parseOutputSecurityConfig(conf)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse security config: %w", err)
+		return nil, err
 	}
 
-	securityMode := securityConf["mode"].(string)
-	security := connection.SecurityConfig{
-		Mode: securityMode,
-	}
-
-	if securityMode == "psk" {
-		if identity, exists := securityConf["psk_identity"]; exists {
-			security.PSKIdentity = identity.(string)
-		}
-		if key, exists := securityConf["psk_key"]; exists {
-			security.PSKKey = key.(string)
-		}
-	} else if securityMode == "certificate" {
-		if certFile, exists := securityConf["cert_file"]; exists {
-			security.CertFile = certFile.(string)
-		}
-		if keyFile, exists := securityConf["key_file"]; exists {
-			security.KeyFile = keyFile.(string)
-		}
-		if caCertFile, exists := securityConf["ca_cert_file"]; exists {
-			security.CACertFile = caCertFile.(string)
-		}
-		if insecureSkip, exists := securityConf["insecure_skip_verify"]; exists {
-			security.InsecureSkip = insecureSkip.(bool)
-		}
-	}
-
-	// Parse connection pool config
-	poolConf, err := conf.FieldObjectMap("connection_pool")
+	// Parse connection config (includes pool settings)
+	connConfig, err := parseOutputConnectionConfig(conf, endpoints, protocol, security)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse connection_pool config: %w", err)
-	}
-
-	connConfig := connection.Config{
-		Endpoints:           endpoints,
-		Protocol:            protocol,
-		MaxPoolSize:         poolConf["max_size"].(int),
-		IdleTimeout:         poolConf["idle_timeout"].(time.Duration),
-		HealthCheckInterval: poolConf["health_check_interval"].(time.Duration),
-		ConnectTimeout:      poolConf["connect_timeout"].(time.Duration),
-		Security:            security,
+		return nil, err
 	}
 
 	// Parse request options
-	reqOptsConf, err := conf.FieldObjectMap("request_options")
+	requestOptions, err := parseRequestOptions(conf)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse request_options config: %w", err)
-	}
-
-	requestOptions := RequestOptions{
-		Confirmable:      reqOptsConf["confirmable"].(bool),
-		Timeout:          reqOptsConf["timeout"].(time.Duration),
-		AutoDetectFormat: reqOptsConf["auto_detect_format"].(bool),
-	}
-
-	if contentFormat, exists := reqOptsConf["content_format"]; exists {
-		requestOptions.ContentFormat = contentFormat.(string)
+		return nil, err
 	}
 
 	// Parse retry policy
-	retryConf, err := conf.FieldObjectMap("retry_policy")
+	retryPolicy, err := parseOutputRetryPolicy(conf)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse retry_policy config: %w", err)
-	}
-
-	retryPolicy := RetryPolicy{
-		MaxRetries:      retryConf["max_retries"].(int),
-		InitialInterval: retryConf["initial_interval"].(time.Duration),
-		MaxInterval:     retryConf["max_interval"].(time.Duration),
-		Multiplier:      retryConf["multiplier"].(float64),
-		Jitter:          retryConf["jitter"].(bool),
+		return nil, err
 	}
 
 	// Parse converter config
-	convConf, err := conf.FieldObjectMap("converter")
+	converterConfig, err := parseOutputConverterConfig(conf)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse converter config: %w", err)
-	}
-
-	converterConfig := converter.Config{
-		DefaultContentFormat: convConf["default_content_format"].(string),
-		CompressionEnabled:   convConf["compression_enabled"].(bool),
-		MaxPayloadSize:       convConf["max_payload_size"].(int),
-		PreserveOptions:      convConf["preserve_options"].(bool),
+		return nil, err
 	}
 
 	// Initialize components
 	connManager, err := connection.NewManager(connConfig, mgr.Logger(), mgr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create connection manager: %w", err)
+		return nil, fmt.Errorf("failed to create connection manager for endpoints %v: %w", endpoints, err)
 	}
 
 	conv := converter.NewConverter(converterConfig, mgr.Logger())
@@ -331,31 +270,31 @@ func (o *Output) WriteWithRetry(ctx context.Context, msg *service.Message, retry
 	// Get connection from pool
 	conn, err := o.connManager.Get(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get connection: %w", err)
+		// Adding message ID for context, though the message itself hasn't been processed yet.
+		return fmt.Errorf("failed to get CoAP connection for message ID %s (endpoints: %v): %w", msg.ID(), o.config.Endpoints, err)
 	}
 	defer o.connManager.Put(conn)
 
 	o.metrics.ConnectionsUsed.Incr(1)
+	endpoint := conn.Endpoint() // For logging
 
-	// Convert Benthos message to CoAP message
-	coapMsg, err := o.converter.MessageToCoAP(msg)
-	if err != nil {
-		o.metrics.MessagesFailed.Incr(1)
-		return fmt.Errorf("failed to convert message: %w", err)
+	// Determine path
+	path, pathExists := msg.MetaGet("coap_path")
+	if !pathExists {
+		if o.config.DefaultPath == "" {
+			o.logger.Warnf("No coap_path in message metadata and no default_path configured for message ID %s to endpoint %s. Sending to '/'.", msg.ID(), endpoint)
+			path = "/" // Fallback if truly no path can be determined.
+		} else {
+			path = o.config.DefaultPath
+		}
+		msg.MetaSet("coap_path", path) // Set for clarity and potential re-conversion
 	}
 
-	// Set default path if not specified in message metadata
-	if path, exists := msg.MetaGet("coap_path"); exists {
-		// Path already set in metadata
-		_ = path
-	} else if o.config.DefaultPath != "" {
-		// Use default path
-		msg.MetaSet("coap_path", o.config.DefaultPath)
-		// Re-convert with path
-		coapMsg, err = o.converter.MessageToCoAP(msg)
-		if err != nil {
-			return fmt.Errorf("failed to re-convert message with path: %w", err)
-		}
+	// Convert Benthos message to CoAP message
+	coapMsg, err := o.converter.MessageToCoAP(msg) // converter now uses coap_path from metadata
+	if err != nil {
+		o.metrics.MessagesFailed.Incr(1)
+		return fmt.Errorf("failed to convert Benthos message ID %s to CoAP message for path %s on endpoint %s: %w", msg.ID(), path, endpoint, err)
 	}
 
 	// Configure request type
@@ -366,27 +305,36 @@ func (o *Output) WriteWithRetry(ctx context.Context, msg *service.Message, retry
 	}
 
 	// Send CoAP request
-	err = o.sendCoAPMessage(ctx, conn, coapMsg)
+	err = o.sendCoAPMessage(ctx, conn, coapMsg, path) // Pass path for logging
 	if err != nil {
 		if retryCount < o.config.RetryPolicy.MaxRetries {
 			o.metrics.RetriesTotal.Incr(1)
-			delay := o.calculateBackoff(retryCount)
+			backoffConfig := utils.BackoffConfig{
+				InitialInterval: o.config.RetryPolicy.InitialInterval,
+				MaxInterval:     o.config.RetryPolicy.MaxInterval,
+				Multiplier:      o.config.RetryPolicy.Multiplier,
+				Jitter:          o.config.RetryPolicy.Jitter,
+			}
+			delay := utils.CalculateBackoff(retryCount, backoffConfig)
+			tokenStr := ""
+			if coapMsg.Token() != nil {
+				tokenStr = coapMsg.Token().String()
+			}
 
-			o.logger.Warn("CoAP request failed, retrying",
-				"error", err,
-				"retry_count", retryCount+1,
-				"delay", delay)
+			o.logger.Warnf("CoAP request failed for message ID %s to path %s on endpoint %s (token: %s), retrying (%d/%d) in %v: %v",
+				msg.ID(), path, endpoint, tokenStr, retryCount+1, o.config.RetryPolicy.MaxRetries, delay, err)
 
 			select {
 			case <-time.After(delay):
 				return o.WriteWithRetry(ctx, msg, retryCount+1)
 			case <-ctx.Done():
+				o.logger.Warnf("Context done during retry backoff for message ID %s to path %s on endpoint %s: %v", msg.ID(), path, endpoint, ctx.Err())
 				return ctx.Err()
 			}
 		}
 
 		o.metrics.MessagesFailed.Incr(1)
-		return fmt.Errorf("CoAP request failed after %d retries: %w", retryCount, err)
+		return fmt.Errorf("CoAP request failed for message ID %s to path %s on endpoint %s after %d retries: %w", msg.ID(), path, endpoint, retryCount, err)
 	}
 
 	o.metrics.MessagesSent.Incr(1)
@@ -398,106 +346,282 @@ func (o *Output) sendCoAPMessage(ctx context.Context, connWrapper *connection.Co
 	requestCtx, cancel := context.WithTimeout(ctx, o.config.RequestOptions.Timeout)
 	defer cancel()
 
+	endpoint := connWrapper.Endpoint()
+	tokenStr := ""
+	if coapMsg.Token() != nil {
+		tokenStr = coapMsg.Token().String()
+	}
+
+	o.logger.Debugf("Sending CoAP message to path %s on endpoint %s (token: %s, type: %s)", path, endpoint, tokenStr, coapMsg.Type())
+
 	switch conn := connWrapper.conn.(type) {
 	case *udp.Conn:
-		return o.sendUDPMessage(requestCtx, conn, coapMsg)
+		return o.sendUDPMessage(requestCtx, conn, coapMsg, endpoint, path, tokenStr)
 	case *tcp.Conn:
-		return o.sendTCPMessage(requestCtx, conn, coapMsg)
+		return o.sendTCPMessage(requestCtx, conn, coapMsg, endpoint, path, tokenStr)
 	default:
-		return fmt.Errorf("unsupported connection type: %T", conn)
+		return fmt.Errorf("unsupported connection type %T for path %s on endpoint %s", conn, path, endpoint)
 	}
 }
 
-func (o *Output) sendUDPMessage(ctx context.Context, conn *udp.Conn, coapMsg *message.Message) error {
+func (o *Output) sendUDPMessage(ctx context.Context, conn *udp.Conn, coapMsg *message.Message, endpoint, path, tokenStr string) error {
 	if coapMsg.Type() == message.Confirmable {
-		// Wait for acknowledgment
 		resp, err := conn.DoWithMessage(ctx, coapMsg)
 		if err != nil {
-			return fmt.Errorf("UDP confirmable request failed: %w", err)
+			// Check for context timeout specifically
+			if ctx.Err() == context.DeadlineExceeded {
+				o.metrics.RequestsTimeout.Incr(1)
+				return fmt.Errorf("UDP confirmable request timed out for path %s on endpoint %s (token: %s): %w", path, endpoint, tokenStr, err)
+			}
+			return fmt.Errorf("UDP confirmable request failed for path %s on endpoint %s (token: %s): %w", path, endpoint, tokenStr, err)
 		}
 
-		// Check response code
 		if resp.Code().IsClientError() || resp.Code().IsServerError() {
-			return fmt.Errorf("CoAP error response: %s", resp.Code())
+			return fmt.Errorf("CoAP error response for path %s on endpoint %s (token: %s): Code %s, Body: %s", path, endpoint, tokenStr, resp.Code(), string(resp.Body()))
 		}
-
-		o.logger.Debug("UDP confirmable request successful", "response_code", resp.Code())
+		o.logger.Debugf("UDP confirmable request successful for path %s on endpoint %s (token: %s), response code: %s", path, endpoint, tokenStr, resp.Code())
 	} else {
-		// Fire and forget
 		err := conn.WriteMessage(coapMsg)
 		if err != nil {
-			return fmt.Errorf("UDP non-confirmable request failed: %w", err)
+			return fmt.Errorf("UDP non-confirmable request failed for path %s on endpoint %s (token: %s): %w", path, endpoint, tokenStr, err)
 		}
-
-		o.logger.Debug("UDP non-confirmable request sent")
+		o.logger.Debugf("UDP non-confirmable request sent for path %s on endpoint %s (token: %s)", path, endpoint, tokenStr)
 	}
-
 	return nil
 }
 
-func (o *Output) sendTCPMessage(ctx context.Context, conn *tcp.Conn, coapMsg *message.Message) error {
-	// TCP is always reliable, so treat all messages as confirmable
+func (o *Output) sendTCPMessage(ctx context.Context, conn *tcp.Conn, coapMsg *message.Message, endpoint, path, tokenStr string) error {
 	resp, err := conn.DoWithMessage(ctx, coapMsg)
 	if err != nil {
-		return fmt.Errorf("TCP request failed: %w", err)
+		if ctx.Err() == context.DeadlineExceeded {
+			o.metrics.RequestsTimeout.Incr(1)
+			return fmt.Errorf("TCP request timed out for path %s on endpoint %s (token: %s): %w", path, endpoint, tokenStr, err)
+		}
+		return fmt.Errorf("TCP request failed for path %s on endpoint %s (token: %s): %w", path, endpoint, tokenStr, err)
 	}
 
-	// Check response code
 	if resp.Code().IsClientError() || resp.Code().IsServerError() {
-		return fmt.Errorf("CoAP error response: %s", resp.Code())
+		return fmt.Errorf("CoAP error response for path %s on endpoint %s (token: %s): Code %s, Body: %s", path, endpoint, tokenStr, resp.Code(), string(resp.Body()))
 	}
-
-	o.logger.Debug(fmt.Sprintf("TCP request successful, response_code: %v", resp.Code()))
+	o.logger.Debugf("TCP request successful for path %s on endpoint %s (token: %s), response code: %s", path, endpoint, tokenStr, resp.Code())
 	return nil
-}
-
-func (o *Output) calculateBackoff(retryCount int) time.Duration {
-	delay := float64(o.config.RetryPolicy.InitialInterval)
-
-	for i := 0; i < retryCount; i++ {
-		delay *= o.config.RetryPolicy.Multiplier
-	}
-
-	if time.Duration(delay) > o.config.RetryPolicy.MaxInterval {
-		delay = float64(o.config.RetryPolicy.MaxInterval)
-	}
-
-	if o.config.RetryPolicy.Jitter {
-		// Add up to 25% jitter
-		jitter := delay * 0.25 * (2*float64(time.Now().UnixNano()%100)/100 - 1)
-		delay += jitter
-	}
-
-	return time.Duration(delay)
 }
 
 func (o *Output) WriteBatch(ctx context.Context, batch service.MessageBatch) error {
+	var firstErr error
 	for i, msg := range batch {
 		if err := o.Write(ctx, msg); err != nil {
-			return fmt.Errorf("failed to write message %d in batch: %w", i, err)
+			o.logger.Errorf("Failed to write message ID %s (index %d in batch) to CoAP endpoint: %v", msg.ID(), i, err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("failed to write message ID %s (index %d in batch): %w", msg.ID(), i, err)
+			}
+			// Decide on batch error handling: stop on first error or try all?
+			// Current behavior: try all, return first error.
 		}
 	}
-	return nil
+	return firstErr
 }
 
 func (o *Output) Close(ctx context.Context) error {
-	o.logger.Info("Closing CoAP output")
+	o.logger.Infof("Closing CoAP output for endpoints: %v", o.config.Endpoints)
 
-	if err := o.connManager.Close(); err != nil {
-		o.logger.Error(fmt.Sprintf("Failed to close connection manager: %v", err))
-		return err
+	if o.connManager != nil {
+		if err := o.connManager.Close(); err != nil {
+			o.logger.Errorf("Failed to close connection manager for CoAP output (endpoints %v): %v", o.config.Endpoints, err)
+			// Decide if this error should prevent further cleanup or be returned.
+			// For now, we log and continue, then return the error.
+			return err
+		}
 	}
 
-	o.logger.Info("CoAP output closed")
+	o.logger.Infof("CoAP output closed for endpoints: %v", o.config.Endpoints)
 	return nil
 }
 
 // Health returns the current health status of the output
 func (o *Output) Health() map[string]interface{} {
-	return map[string]interface{}{
-		"status":      "healthy",
-		"endpoints":   o.config.Endpoints,
-		"protocol":    o.config.Protocol,
-		"connections": "available", // Could be enhanced with actual pool status
+	healthStatus := map[string]interface{}{
+		"status":       "healthy", // Default to healthy, can be changed based on checks
+		"endpoints":    o.config.Endpoints,
+		"protocol":     o.config.Protocol,
+		"default_path": o.config.DefaultPath,
 	}
+
+	if o.connManager != nil {
+		// You might want to expand connManager.HealthStatus() to provide more details
+		// For now, let's assume it returns a map that can be merged.
+		// healthStatus["connection_pool"] = o.connManager.HealthStatus()
+		// Simplified:
+		healthStatus["connection_pool_status"] = "active" // Placeholder
+	} else {
+		healthStatus["status"] = "degraded"
+		healthStatus["connection_pool_status"] = "inactive"
+	}
+
+	// Add more checks here if needed, e.g., try a ping to an endpoint
+	// For now, "healthy" means the output component is configured and running.
+
+	return healthStatus
+}
+
+func parseOutputSecurityConfig(conf *service.ParsedConfig) (connection.SecurityConfig, error) {
+	securityMode, err := conf.FieldString("security", "mode")
+	if err != nil {
+		return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.mode: %w", err)
+	}
+	security := connection.SecurityConfig{
+		Mode: securityMode,
+	}
+
+	if securityMode == "psk" {
+		if conf.ContainsPath("security", "psk_identity") {
+			security.PSKIdentity, err = conf.FieldString("security", "psk_identity")
+			if err != nil {
+				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.psk_identity: %w", err)
+			}
+		}
+		if conf.ContainsPath("security", "psk_key") {
+			security.PSKKey, err = conf.FieldString("security", "psk_key")
+			if err != nil {
+				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.psk_key: %w", err)
+			}
+		}
+	} else if securityMode == "certificate" {
+		if conf.ContainsPath("security", "cert_file") {
+			security.CertFile, err = conf.FieldString("security", "cert_file")
+			if err != nil {
+				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.cert_file: %w", err)
+			}
+		}
+		if conf.ContainsPath("security", "key_file") {
+			security.KeyFile, err = conf.FieldString("security", "key_file")
+			if err != nil {
+				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.key_file: %w", err)
+			}
+		}
+		if conf.ContainsPath("security", "ca_cert_file") {
+			security.CACertFile, err = conf.FieldString("security", "ca_cert_file")
+			if err != nil {
+				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.ca_cert_file: %w", err)
+			}
+		}
+		security.InsecureSkip, err = conf.FieldBool("security", "insecure_skip_verify")
+		if err != nil {
+			return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.insecure_skip_verify: %w", err)
+		}
+	}
+	return security, nil
+}
+
+func parseOutputConnectionConfig(conf *service.ParsedConfig, endpoints []string, protocol string, securityCfg connection.SecurityConfig) (connection.Config, error) {
+	maxSize, err := conf.FieldInt("connection_pool", "max_size")
+	if err != nil {
+		return connection.Config{}, fmt.Errorf("failed to parse connection_pool.max_size: %w", err)
+	}
+	idleTimeout, err := conf.FieldDuration("connection_pool", "idle_timeout")
+	if err != nil {
+		return connection.Config{}, fmt.Errorf("failed to parse connection_pool.idle_timeout: %w", err)
+	}
+	healthCheckInterval, err := conf.FieldDuration("connection_pool", "health_check_interval")
+	if err != nil {
+		return connection.Config{}, fmt.Errorf("failed to parse connection_pool.health_check_interval: %w", err)
+	}
+	connectTimeout, err := conf.FieldDuration("connection_pool", "connect_timeout")
+	if err != nil {
+		return connection.Config{}, fmt.Errorf("failed to parse connection_pool.connect_timeout: %w", err)
+	}
+
+	return connection.Config{
+		Endpoints:           endpoints,
+		Protocol:            protocol,
+		MaxPoolSize:         maxSize,
+		IdleTimeout:         idleTimeout,
+		HealthCheckInterval: healthCheckInterval,
+		ConnectTimeout:      connectTimeout,
+		Security:            securityCfg,
+	}, nil
+}
+
+func parseOutputConverterConfig(conf *service.ParsedConfig) (converter.Config, error) {
+	defaultContentFormat, err := conf.FieldString("converter", "default_content_format")
+	if err != nil {
+		return converter.Config{}, fmt.Errorf("failed to parse converter.default_content_format: %w", err)
+	}
+	compressionEnabled, err := conf.FieldBool("converter", "compression_enabled")
+	if err != nil {
+		return converter.Config{}, fmt.Errorf("failed to parse converter.compression_enabled: %w", err)
+	}
+	maxPayloadSize, err := conf.FieldInt("converter", "max_payload_size")
+	if err != nil {
+		return converter.Config{}, fmt.Errorf("failed to parse converter.max_payload_size: %w", err)
+	}
+	preserveOptions, err := conf.FieldBool("converter", "preserve_options")
+	if err != nil {
+		return converter.Config{}, fmt.Errorf("failed to parse converter.preserve_options: %w", err)
+	}
+	return converter.Config{
+		DefaultContentFormat: defaultContentFormat,
+		CompressionEnabled:   compressionEnabled,
+		MaxPayloadSize:       maxPayloadSize,
+		PreserveOptions:      preserveOptions,
+	}, nil
+}
+
+func parseRequestOptions(conf *service.ParsedConfig) (RequestOptions, error) {
+	confirmable, err := conf.FieldBool("request_options", "confirmable")
+	if err != nil {
+		return RequestOptions{}, fmt.Errorf("failed to parse request_options.confirmable: %w", err)
+	}
+	timeout, err := conf.FieldDuration("request_options", "timeout")
+	if err != nil {
+		return RequestOptions{}, fmt.Errorf("failed to parse request_options.timeout: %w", err)
+	}
+	autoDetectFormat, err := conf.FieldBool("request_options", "auto_detect_format")
+	if err != nil {
+		return RequestOptions{}, fmt.Errorf("failed to parse request_options.auto_detect_format: %w", err)
+	}
+
+	opts := RequestOptions{
+		Confirmable:      confirmable,
+		Timeout:          timeout,
+		AutoDetectFormat: autoDetectFormat,
+	}
+
+	if conf.ContainsPath("request_options", "content_format") {
+		opts.ContentFormat, err = conf.FieldString("request_options", "content_format")
+		if err != nil {
+			return RequestOptions{}, fmt.Errorf("failed to parse request_options.content_format: %w", err)
+		}
+	}
+	return opts, nil
+}
+
+func parseOutputRetryPolicy(conf *service.ParsedConfig) (RetryPolicy, error) {
+	maxRetries, err := conf.FieldInt("retry_policy", "max_retries")
+	if err != nil {
+		return RetryPolicy{}, fmt.Errorf("failed to parse retry_policy.max_retries: %w", err)
+	}
+	initialInterval, err := conf.FieldDuration("retry_policy", "initial_interval")
+	if err != nil {
+		return RetryPolicy{}, fmt.Errorf("failed to parse retry_policy.initial_interval: %w", err)
+	}
+	maxInterval, err := conf.FieldDuration("retry_policy", "max_interval")
+	if err != nil {
+		return RetryPolicy{}, fmt.Errorf("failed to parse retry_policy.max_interval: %w", err)
+	}
+	multiplier, err := conf.FieldFloat("retry_policy", "multiplier")
+	if err != nil {
+		return RetryPolicy{}, fmt.Errorf("failed to parse retry_policy.multiplier: %w", err)
+	}
+	jitter, err := conf.FieldBool("retry_policy", "jitter")
+	if err != nil {
+		return RetryPolicy{}, fmt.Errorf("failed to parse retry_policy.jitter: %w", err)
+	}
+	return RetryPolicy{
+		MaxRetries:      maxRetries,
+		InitialInterval: initialInterval,
+		MaxInterval:     maxInterval,
+		Multiplier:      multiplier,
+		Jitter:          jitter,
+	}, nil
 }
