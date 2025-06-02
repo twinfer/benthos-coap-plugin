@@ -1,0 +1,242 @@
+# examples/input-sensors.yaml
+# IoT sensor data ingestion via CoAP observe
+input:
+  coap:
+    endpoints:
+      - "coap://iot-sensor-1:5683"
+      - "coap://iot-sensor-2:5683"
+      - "coap://iot-gateway:5683"
+    observe_paths:
+      - "/sensors/temperature"
+      - "/sensors/humidity" 
+      - "/sensors/+/data"  # Wildcard for multiple sensors
+    protocol: "udp"
+    connection_pool:
+      max_size: 10
+      idle_timeout: "60s"
+      health_check_interval: "30s"
+    observer:
+      buffer_size: 5000
+      observe_timeout: "10m"
+    retry_policy:
+      max_retries: 5
+      initial_interval: "2s"
+      max_interval: "60s"
+    circuit_breaker:
+      enabled: true
+      failure_threshold: 3
+      timeout: "30s"
+
+pipeline:
+  processors:
+    - mapping: |
+        root.device_id = this.metadata.coap_uri_path.split("/")[2]
+        root.sensor_type = this.metadata.coap_uri_path.split("/")[1] 
+        root.timestamp = now()
+        root.data = this.content().parse_json()
+        root.metadata = this.metadata.without("coap_options")
+
+output:
+  kafka:
+    addresses: ["kafka:9092"]
+    topic: "iot-sensor-data"
+    partition: '${! this.device_id.hash() % 10 }'
+
+---
+
+# examples/output-commands.yaml  
+# Send commands to IoT devices via CoAP
+input:
+  kafka:
+    addresses: ["kafka:9092"]
+    topics: ["device-commands"]
+    consumer_group: "coap-command-sender"
+
+pipeline:
+  processors:
+    - mapping: |
+        meta coap_path = "/actuators/" + this.device_id + "/command"
+        meta coap_method = "POST"
+        root = this.command_data
+
+output:
+  coap:
+    endpoints:
+      - "coap://device-gateway:5683"
+    default_path: "/commands"
+    protocol: "udp"
+    request_options:
+      confirmable: true
+      timeout: "10s"
+      content_format: "application/json"
+    retry_policy:
+      max_retries: 3
+      initial_interval: "1s"
+      max_interval: "10s"
+
+---
+
+# examples/secure-dtls.yaml
+# Secure CoAP communication with DTLS
+input:
+  coap:
+    endpoints:
+      - "coaps://secure-device:5684"
+    observe_paths:
+      - "/secure/data"
+    protocol: "udp-dtls"
+    security:
+      mode: "psk"
+      psk_identity: "client-001"
+      psk_key: "${COAP_PSK_KEY}"
+    connection_pool:
+      max_size: 5
+      health_check_interval: "10s"
+
+output:
+  stdout: {}
+
+---
+
+# examples/certificate-auth.yaml
+# Certificate-based authentication
+input:
+  coap:
+    endpoints:
+      - "coaps://enterprise-device:5684"
+    observe_paths:
+      - "/enterprise/+/metrics"
+    protocol: "tcp-tls"
+    security:
+      mode: "certificate"
+      cert_file: "/etc/ssl/client.crt"
+      key_file: "/etc/ssl/client.key"
+      ca_cert_file: "/etc/ssl/ca.crt"
+    observer:
+      buffer_size: 10000
+
+pipeline:
+  processors:
+    - mapping: |
+        root.enterprise_unit = this.metadata.coap_uri_path.split("/")[2]
+        root.metrics = this.content().parse_json()
+        root.received_at = now()
+
+output:
+  prometheus:
+    push_url: "http://pushgateway:9091"
+    push_job_name: "coap-metrics"
+
+---
+
+# examples/batch-processing.yaml
+# High-throughput batch processing
+input:
+  coap:
+    endpoints:
+      - "coap://high-volume-sensor:5683"
+    observe_paths:
+      - "/stream/data"
+    protocol: "tcp"  # TCP for higher throughput
+    observer:
+      buffer_size: 50000
+    converter:
+      compression_enabled: true
+      max_payload_size: 2097152  # 2MB
+
+pipeline:
+  processors:
+    - batch:
+        count: 1000
+        period: "5s"
+    - archive:
+        format: "json_array"
+    - compress:
+        algorithm: "gzip"
+
+output:
+  aws_s3:
+    bucket: "iot-data-lake"
+    path: "coap-data/${! timestamp_unix() }.json.gz"
+
+---
+
+# examples/multi-protocol.yaml
+# Mixed protocol usage
+input:
+  broker:
+    inputs:
+      - coap:
+          endpoints: ["coap://udp-sensors:5683"]
+          observe_paths: ["/udp/+/data"]
+          protocol: "udp"
+      - coap:
+          endpoints: ["coap://tcp-devices:5683"]
+          observe_paths: ["/tcp/+/events"]
+          protocol: "tcp"
+      - coap:
+          endpoints: ["coaps://secure-gw:5684"]
+          observe_paths: ["/secure/+/alerts"]
+          protocol: "udp-dtls"
+          security:
+            mode: "psk"
+            psk_identity: "monitor"
+            psk_key: "${DTLS_PSK}"
+
+pipeline:
+  processors:
+    - switch:
+        - check: 'this.metadata.coap_uri_path.contains("/alerts")'
+          processors:
+            - mapping: 'root.priority = "high"'
+        - processors:
+            - mapping: 'root.priority = "normal"'
+
+output:
+  switch:
+    cases:
+      - check: 'this.priority == "high"'
+        output:
+          http_client:
+            url: "http://alert-manager:9093/api/v1/alerts"
+            verb: "POST"
+      - output:
+          kafka:
+            addresses: ["kafka:9092"]
+            topic: "coap-events"
+
+---
+
+# examples/debugging.yaml
+# Development and debugging configuration
+logger:
+  level: DEBUG
+  format: json
+
+input:
+  coap:
+    endpoints:
+      - "coap://localhost:5683"
+    observe_paths:
+      - "/debug/test"
+    protocol: "udp"
+    converter:
+      preserve_options: true  # Keep all CoAP options for debugging
+
+pipeline:
+  processors:
+    - log:
+        level: INFO
+        message: "Received CoAP message: ${! content() }"
+    - mapping: |
+        root = this
+        root.debug_info = {
+          "received_at": now(),
+          "size_bytes": content().length(),
+          "coap_metadata": this.metadata.filter(key -> key.has_prefix("coap_"))
+        }
+
+output:
+  file:
+    path: "/tmp/coap-debug.jsonl"
+    codec: "lines"

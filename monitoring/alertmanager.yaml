@@ -1,0 +1,350 @@
+# monitoring/alertmanager.yml
+global:
+  smtp_smarthost: 'smtp.gmail.com:587'
+  smtp_from: 'alerts@your-org.com'
+  smtp_auth_username: 'alerts@your-org.com'
+  smtp_auth_password: 'your-password'
+
+route:
+  group_by: ['alertname', 'service']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: 'web.hook'
+  routes:
+  - match:
+      severity: critical
+    receiver: 'critical-alerts'
+  - match:
+      severity: warning
+    receiver: 'warning-alerts'
+
+receivers:
+- name: 'web.hook'
+  webhook_configs:
+  - url: 'http://127.0.0.1:5001/'
+
+- name: 'critical-alerts'
+  email_configs:
+  - to: 'oncall@your-org.com'
+    subject: 'CRITICAL: {{ .GroupLabels.service }} Alert'
+    body: |
+      {{ range .Alerts }}
+      Alert: {{ .Annotations.summary }}
+      Description: {{ .Annotations.description }}
+      {{ end }}
+  slack_configs:
+  - api_url: 'YOUR_SLACK_WEBHOOK_URL'
+    channel: '#alerts-critical'
+    title: 'Critical Alert: {{ .GroupLabels.service }}'
+    text: '{{ range .Alerts }}{{ .Annotations.summary }}: {{ .Annotations.description }}{{ end }}'
+
+- name: 'warning-alerts'
+  email_configs:
+  - to: 'team@your-org.com'
+    subject: 'WARNING: {{ .GroupLabels.service }} Alert'
+    body: |
+      {{ range .Alerts }}
+      Alert: {{ .Annotations.summary }}
+      Description: {{ .Annotations.description }}
+      {{ end }}
+
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'service', 'instance']
+
+---
+
+# monitoring/docker-compose-monitoring.yml
+version: '3.8'
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./alerts.yml:/etc/prometheus/alerts.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml
+      - alertmanager-data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+      - '--web.external-url=http://localhost:9093'
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - grafana-data:/var/lib/grafana
+    restart: unless-stopped
+    networks:
+      - monitoring
+    depends_on:
+      - prometheus
+
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki-data:/loki
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  promtail:
+    image: grafana/promtail:latest
+    container_name: promtail
+    volumes:
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ./promtail-config.yml:/etc/promtail/config.yml
+    command: -config.file=/etc/promtail/config.yml
+    restart: unless-stopped
+    networks:
+      - monitoring
+    depends_on:
+      - loki
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  alertmanager-data:
+  loki-data:
+
+networks:
+  monitoring:
+    driver: bridge
+
+---
+
+# monitoring/promtail-config.yml
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: containers
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: containerlogs
+          __path__: /var/lib/docker/containers/*/*log
+
+    pipeline_stages:
+      - json:
+          expressions:
+            output: log
+            stream: stream
+            attrs:
+      - json:
+          expressions:
+            tag:
+          source: attrs
+      - regex:
+          expression: (?P<container_name>(?:[^|]*))\|
+          source: tag
+      - timestamp:
+          format: RFC3339Nano
+          source: time
+      - labels:
+          stream:
+          container_name:
+      - output:
+          source: output
+
+---
+
+# monitoring/grafana/dashboards/benthos-coap-detailed.json
+{
+  "dashboard": {
+    "id": null,
+    "title": "Benthos CoAP Detailed Metrics",
+    "tags": ["benthos", "coap", "detailed"],
+    "style": "dark",
+    "timezone": "",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Connection Pool Status",
+        "type": "table",
+        "targets": [
+          {
+            "expr": "coap_connection_pool_size",
+            "legendFormat": "{{ endpoint }} Pool Size"
+          },
+          {
+            "expr": "coap_connection_pool_utilization",
+            "legendFormat": "{{ endpoint }} Utilization"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "Circuit Breaker States",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "coap_circuit_breaker_state",
+            "legendFormat": "{{ path }} State"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+      },
+      {
+        "id": 3,
+        "title": "Message Processing Latency",
+        "type": "heatmap",
+        "targets": [
+          {
+            "expr": "rate(coap_message_processing_duration_seconds_bucket[5m])",
+            "legendFormat": "{{ le }}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+      }
+    ],
+    "time": {"from": "now-6h", "to": "now"},
+    "refresh": "30s"
+  }
+}
+
+---
+
+# monitoring/setup-monitoring.sh
+#!/bin/bash
+set -e
+
+echo "Setting up monitoring stack for Benthos CoAP Plugin..."
+
+# Create monitoring directories
+mkdir -p monitoring/{data/{prometheus,grafana,alertmanager,loki},logs}
+
+# Set permissions for Grafana
+sudo chown -R 472:472 monitoring/data/grafana
+
+# Start monitoring stack
+echo "Starting monitoring services..."
+docker-compose -f monitoring/docker-compose-monitoring.yml up -d
+
+# Wait for services to start
+echo "Waiting for services to start..."
+sleep 30
+
+# Import Grafana dashboards
+echo "Importing Grafana dashboards..."
+curl -X POST \
+  http://admin:admin@localhost:3000/api/dashboards/db \
+  -H 'Content-Type: application/json' \
+  -d @monitoring/grafana/dashboards/benthos-coap-overview.json
+
+# Configure Prometheus targets
+echo "Prometheus available at: http://localhost:9090"
+echo "Grafana available at: http://localhost:3000 (admin/admin)"
+echo "Alertmanager available at: http://localhost:9093"
+
+echo "✅ Monitoring stack setup complete!"
+
+---
+
+# monitoring/grafana/dashboards/alerts-dashboard.json
+{
+  "dashboard": {
+    "id": null,
+    "title": "Benthos CoAP Alerts",
+    "tags": ["benthos", "coap", "alerts"],
+    "style": "dark",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Active Alerts",
+        "type": "alertlist",
+        "targets": [],
+        "gridPos": {"h": 12, "w": 24, "x": 0, "y": 0},
+        "options": {
+          "showOptions": "current",
+          "maxItems": 20,
+          "sortOrder": "importanceDesc"
+        }
+      },
+      {
+        "id": 2,
+        "title": "Alert History",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "ALERTS{job=\"benthos-coap\"}",
+            "legendFormat": "{{ alertname }} - {{ severity }}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 12}
+      }
+    ],
+    "time": {"from": "now-24h", "to": "now"},
+    "refresh": "1m"
+  }
+}

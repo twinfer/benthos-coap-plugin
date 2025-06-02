@@ -1,0 +1,174 @@
+# monitoring/prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    cluster: 'benthos-coap'
+    replica: 'prometheus-1'
+
+rule_files:
+  - "alerts.yml"
+
+scrape_configs:
+  - job_name: 'benthos-coap'
+    static_configs:
+      - targets: ['benthos-coap:4195']
+    metrics_path: '/stats'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    honor_labels: true
+    params:
+      format: ['prometheus']
+
+  - job_name: 'benthos-coap-health'
+    static_configs:
+      - targets: ['benthos-coap:4195']
+    metrics_path: '/ping'
+    scrape_interval: 30s
+    scrape_timeout: 5s
+
+  - job_name: 'coap-endpoints'
+    static_configs:
+      - targets: 
+        - 'coap-server:5683'
+        - 'iot-device-1:5683'
+        - 'iot-device-2:5683'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+      scheme: http
+      timeout: 10s
+      api_version: v2
+
+storage:
+  tsdb:
+    path: /prometheus
+    retention.time: 15d
+    retention.size: 50GB
+    wal-compression: true
+
+---
+
+# monitoring/alerts.yml
+groups:
+  - name: benthos-coap-critical
+    interval: 30s
+    rules:
+      - alert: BenthosCoAPDown
+        expr: up{job="benthos-coap"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: benthos-coap
+        annotations:
+          summary: "Benthos CoAP service is down"
+          description: "Benthos CoAP service has been down for more than 1 minute"
+          runbook_url: "https://your-org.github.io/benthos-coap/runbooks/service-down"
+
+      - alert: BenthosCoAPConnectionsDown
+        expr: coap_connections_active == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: benthos-coap
+        annotations:
+          summary: "No active CoAP connections"
+          description: "All CoAP connections are down for {{ $labels.instance }}"
+          runbook_url: "https://your-org.github.io/benthos-coap/runbooks/connections-down"
+
+      - alert: BenthosCoAPHighErrorRate
+        expr: rate(coap_input_errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+          service: benthos-coap
+        annotations:
+          summary: "High error rate in Benthos CoAP input"
+          description: "CoAP input error rate is {{ $value }} errors per second on {{ $labels.instance }}"
+          runbook_url: "https://your-org.github.io/benthos-coap/runbooks/high-errors"
+
+  - name: benthos-coap-warning
+    interval: 60s
+    rules:
+      - alert: BenthosCoAPObserversDown
+        expr: coap_observations_active == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: benthos-coap
+        annotations:
+          summary: "No active CoAP observers"
+          description: "All CoAP observations have stopped on {{ $labels.instance }}"
+
+      - alert: BenthosCoAPHighMessageDropRate
+        expr: rate(coap_input_messages_dropped[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+          service: benthos-coap
+        annotations:
+          summary: "High message drop rate"
+          description: "Dropping {{ $value }} messages per second on {{ $labels.instance }}"
+
+      - alert: BenthosCoAPCircuitBreakerOpen
+        expr: coap_circuit_breaker_open > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: benthos-coap
+        annotations:
+          summary: "CoAP circuit breaker is open"
+          description: "Circuit breaker is open for {{ $value }} endpoints on {{ $labels.instance }}"
+
+      - alert: BenthosCoAPHighLatency
+        expr: histogram_quantile(0.95, rate(coap_request_duration_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+          service: benthos-coap
+        annotations:
+          summary: "High CoAP request latency"
+          description: "95th percentile latency is {{ $value }}s on {{ $labels.instance }}"
+
+      - alert: BenthosCoAPLowThroughput
+        expr: rate(coap_input_messages_read_total[5m]) < 1
+        for: 10m
+        labels:
+          severity: warning
+          service: benthos-coap
+        annotations:
+          summary: "Low message throughput"
+          description: "Message rate is {{ $value }} messages per second on {{ $labels.instance }}"
+
+  - name: benthos-coap-info
+    interval: 120s
+    rules:
+      - alert: BenthosCoAPHighMemoryUsage
+        expr: process_resident_memory_bytes{job="benthos-coap"} > 1073741824  # 1GB
+        for: 5m
+        labels:
+          severity: info
+          service: benthos-coap
+        annotations:
+          summary: "High memory usage"
+          description: "Memory usage is {{ $value | humanizeBytes }} on {{ $labels.instance }}"
+
+      - alert: BenthosCoAPConnectionPoolUtilization
+        expr: (coap_connections_active / coap_connection_pool_max_size) > 0.8
+        for: 5m
+        labels:
+          severity: info
+          service: benthos-coap
+        annotations:
+          summary: "High connection pool utilization"
+          description: "Connection pool is {{ $value | humanizePercentage }} utilized on {{ $labels.instance }}"

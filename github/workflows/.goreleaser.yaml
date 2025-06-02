@@ -1,0 +1,219 @@
+# .goreleaser.yaml
+project_name: benthos-coap
+
+env:
+  - CGO_ENABLED=0
+
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+
+builds:
+  - id: benthos-coap
+    main: ./cmd
+    binary: benthos-coap
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X main.Version={{.Version}}
+      - -X main.GitCommit={{.FullCommit}}
+      - -X main.BuildTime={{.Date}}
+    flags:
+      - -trimpath
+
+archives:
+  - id: benthos-coap
+    builds:
+      - benthos-coap
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - README.md
+      - LICENSE
+      - CHANGELOG.md
+      - examples/**/*
+
+dockers:
+  - image_templates:
+      - "ghcr.io/your-org/benthos-coap:{{ .Version }}-amd64"
+      - "ghcr.io/your-org/benthos-coap:latest-amd64"
+    dockerfile: Dockerfile
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--build-arg=VERSION={{.Version}}"
+      - "--build-arg=GIT_COMMIT={{.FullCommit}}"
+      - "--build-arg=BUILD_TIME={{.Date}}"
+    goos: linux
+    goarch: amd64
+
+  - image_templates:
+      - "ghcr.io/your-org/benthos-coap:{{ .Version }}-arm64"
+      - "ghcr.io/your-org/benthos-coap:latest-arm64"
+    dockerfile: Dockerfile
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--build-arg=VERSION={{.Version}}"
+      - "--build-arg=GIT_COMMIT={{.FullCommit}}"
+      - "--build-arg=BUILD_TIME={{.Date}}"
+    goos: linux
+    goarch: arm64
+
+docker_manifests:
+  - name_template: "ghcr.io/your-org/benthos-coap:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/your-org/benthos-coap:{{ .Version }}-amd64"
+      - "ghcr.io/your-org/benthos-coap:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/your-org/benthos-coap:latest"
+    image_templates:
+      - "ghcr.io/your-org/benthos-coap:latest-amd64"
+      - "ghcr.io/your-org/benthos-coap:latest-arm64"
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - "^build:"
+      - "^style:"
+      - "^refactor:"
+      - "^perf:"
+      - "^revert:"
+      - "^Merge"
+  groups:
+    - title: Features
+      regexp: "^.*feat[(\\w)]*:.*$"
+      order: 0
+    - title: Bug Fixes
+      regexp: "^.*fix[(\\w)]*:.*$"
+      order: 1
+    - title: Others
+      order: 999
+
+release:
+  github:
+    owner: your-org
+    name: benthos-coap
+  draft: false
+  prerelease: auto
+  mode: replace
+  header: |
+    ## Benthos CoAP Plugin {{ .Tag }} ({{ .Date }})
+    
+    This release includes:
+    - CoAP input and output plugins for Benthos
+    - Support for UDP, TCP, DTLS, and TCP-TLS protocols
+    - Connection pooling and circuit breaker patterns
+    - Comprehensive monitoring and metrics
+  footer: |
+    ## Docker Images
+    
+    ```bash
+    docker pull ghcr.io/your-org/benthos-coap:{{ .Tag }}
+    ```
+    
+    ## Installation
+    
+    ```bash
+    # Download and install
+    curl -sSL https://github.com/your-org/benthos-coap/releases/download/{{ .Tag }}/benthos-coap_{{ .Version }}_{{ .Os }}_{{ .Arch }}.tar.gz | tar xz
+    sudo mv benthos-coap /usr/local/bin/
+    ```
+
+brews:
+  - name: benthos-coap
+    repository:
+      owner: your-org
+      name: homebrew-tap
+    homepage: "https://github.com/your-org/benthos-coap"
+    description: "CoAP plugin for Benthos stream processor"
+    license: "MIT"
+    test: |
+      system "#{bin}/benthos-coap", "--version"
+
+nfpms:
+  - id: benthos-coap
+    package_name: benthos-coap
+    vendor: Your Organization
+    homepage: https://github.com/your-org/benthos-coap
+    maintainer: Your Name <your-email@example.com>
+    description: CoAP plugin for Benthos stream processor
+    license: MIT
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
+    section: utils
+    priority: optional
+    meta: true
+    contents:
+      - src: ./examples/
+        dst: /etc/benthos-coap/examples/
+        type: config
+      - src: ./README.md
+        dst: /usr/share/doc/benthos-coap/README.md
+        type: doc
+
+publishers:
+  - name: fury.io
+    ids:
+      - benthos-coap
+    dir: "{{ dir .ArtifactPath }}"
+    cmd: curl -F package=@{{ .ArtifactName }} https://{{ .Env.FURY_TOKEN }}@push.fury.io/your-org/
+
+sboms:
+  - artifacts: archive
+
+signs:
+  - cmd: cosign
+    env:
+      - COSIGN_EXPERIMENTAL=1
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+
+docker_signs:
+  - cmd: cosign
+    env:
+      - COSIGN_EXPERIMENTAL=1
+    artifacts: images
+    output: true
+    args:
+      - "sign"
+      - "${artifact}@${digest}"
+      - "--yes"
+
+milestones:
+  - close: true
+    fail_on_error: false
+    name_template: "{{ .Tag }}"
