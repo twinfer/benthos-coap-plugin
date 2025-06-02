@@ -447,7 +447,7 @@ func (o *Output) sendTCPMessage(ctx context.Context, conn *tcp.Conn, coapMsg *me
 		return fmt.Errorf("CoAP error response: %s", resp.Code())
 	}
 
-	o.logger.Debug("TCP request successful", "response_code", resp.Code())
+	o.logger.Debug(fmt.Sprintf("TCP request successful, response_code: %v", resp.Code()))
 	return nil
 }
 
@@ -484,7 +484,7 @@ func (o *Output) Close(ctx context.Context) error {
 	o.logger.Info("Closing CoAP output")
 
 	if err := o.connManager.Close(); err != nil {
-		o.logger.Error("Failed to close connection manager", "error", err)
+		o.logger.Error(fmt.Sprintf("Failed to close connection manager: %v", err))
 		return err
 	}
 

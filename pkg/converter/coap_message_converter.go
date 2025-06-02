@@ -67,7 +67,7 @@ func (c *Converter) CoAPToMessage(coapMsg *message.Message) (*service.Message, e
 
 	// Handle content format specific processing
 	if err := c.processContentFormat(msg, coapMsg); err != nil {
-		c.logger.Warn("Failed to process content format", "error", err)
+		c.logger.Warn(fmt.Sprintf("Failed to process content format: %v", err))
 	}
 
 	return msg, nil
@@ -101,7 +101,7 @@ func (c *Converter) MessageToCoAP(msg *service.Message) (*message.Message, error
 	if c.config.CompressionEnabled && len(payload) > 1024 {
 		compressed, err := c.compressPayload(payload)
 		if err != nil {
-			c.logger.Warn("Failed to compress payload", "error", err)
+			c.logger.Warnf("Failed to compress payload: %v", err)
 		} else if len(compressed) < len(payload) {
 			payload = compressed
 			coapMsg.SetOptionString(message.ContentEncoding, "gzip")

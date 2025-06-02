@@ -49,14 +49,6 @@ type RetryPolicy struct {
 	Jitter          bool          `yaml:"jitter"`
 }
 
-type CircuitConfig struct {
-	Enabled          bool          `yaml:"enabled"`
-	FailureThreshold int           `yaml:"failure_threshold"`
-	SuccessThreshold int           `yaml:"success_threshold"`
-	Timeout          time.Duration `yaml:"timeout"`
-	HalfOpenMaxCalls int           `yaml:"half_open_max_calls"`
-}
-
 type Subscription struct {
 	path         string
 	conn         *connection.ConnectionWrapper
@@ -69,16 +61,6 @@ type Subscription struct {
 	mu           sync.RWMutex
 }
 
-type CircuitBreaker struct {
-	state           int32 // 0: closed, 1: open, 2: half-open
-	failures        int32
-	successes       int32
-	lastFailureTime time.Time
-	config          CircuitConfig
-	halfOpenCalls   int32
-	mu              sync.RWMutex
-}
-
 type Metrics struct {
 	ObservationsActive   *service.MetricCounter
 	ObservationsTotal    *service.MetricCounter
@@ -87,12 +69,6 @@ type Metrics struct {
 	ResubscriptionsTotal *service.MetricCounter
 	CircuitBreakerOpen   *service.MetricCounter
 }
-
-const (
-	CircuitClosed = iota
-	CircuitOpen
-	CircuitHalfOpen
-)
 
 func NewManager(config Config, connManager *connection.Manager, converter *converter.Converter, logger *service.Logger, metrics *service.Resources) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -112,12 +88,12 @@ func NewManager(config Config, connManager *connection.Manager, converter *conve
 		ctx:           ctx,
 		cancel:        cancel,
 		metrics: &Metrics{
-			ObservationsActive:   metrics.MetricCounter("coap_observations_active"),
-			ObservationsTotal:    metrics.MetricCounter("coap_observations_total"),
-			ObservationsFailed:   metrics.MetricCounter("coap_observations_failed"),
-			MessagesReceived:     metrics.MetricCounter("coap_messages_received"),
-			ResubscriptionsTotal: metrics.MetricCounter("coap_resubscriptions_total"),
-			CircuitBreakerOpen:   metrics.MetricCounter("coap_circuit_breaker_open"),
+			ObservationsActive:   metrics.Metrics().NewCounter("coap_observations_active"),
+			ObservationsTotal:    metrics.Metrics().NewCounter("coap_observations_total"),
+			ObservationsFailed:   metrics.Metrics().NewCounter("coap_observations_failed"),
+			MessagesReceived:     metrics.Metrics().NewCounter("coap_messages_received"),
+			ResubscriptionsTotal: metrics.Metrics().NewCounter("coap_resubscriptions_total"),
+			CircuitBreakerOpen:   metrics.Metrics().NewCounter("coap_circuit_breaker_open"),
 		},
 	}
 
@@ -127,7 +103,7 @@ func NewManager(config Config, connManager *connection.Manager, converter *conve
 func (m *Manager) Start() error {
 	for _, path := range m.config.ObservePaths {
 		if err := m.Subscribe(path); err != nil {
-			m.logger.Error("Failed to subscribe to path", "path", path, "error", err)
+			m.logger.Errorf("Failed to subscribe to path %s: %v", path, err)
 			continue
 		}
 	}
@@ -177,7 +153,7 @@ func (m *Manager) observeWithRetry(ctx context.Context, sub *Subscription) {
 		}
 
 		if !sub.circuit.CanExecute() {
-			m.logger.Debug("Circuit breaker open, skipping observe", "path", sub.path)
+			m.logger.Debugf("Circuit breaker open, skipping observe for path: %s", sub.path)
 			time.Sleep(m.config.CircuitBreaker.Timeout)
 			continue
 		}
@@ -188,13 +164,10 @@ func (m *Manager) observeWithRetry(ctx context.Context, sub *Subscription) {
 			sub.circuit.RecordFailure()
 			m.metrics.ObservationsFailed.Incr(1)
 
-			m.logger.Warn("Observe failed, retrying",
-				"path", sub.path,
-				"error", err,
-				"retry_count", atomic.LoadInt32(&sub.retryCount))
+			m.logger.Warnf("Observe failed for path %s, retrying (count: %d): %v", sub.path, atomic.LoadInt32(&sub.retryCount), err)
 
 			if atomic.LoadInt32(&sub.retryCount) >= int32(m.config.RetryPolicy.MaxRetries) {
-				m.logger.Error("Max retries exceeded for observe", "path", sub.path)
+				m.logger.Errorf("Max retries exceeded for observe on path: %s", sub.path)
 				atomic.StoreInt32(&sub.healthy, 0)
 				return
 			}
@@ -267,7 +240,7 @@ func (m *Manager) performObserve(ctx context.Context, sub *Subscription) error {
 func (m *Manager) handleObserveMessage(path string, coapMsg *mux.Message) {
 	sub := m.getSubscription(path)
 	if sub == nil {
-		m.logger.Warn("Received message for unknown subscription", "path", path)
+		m.logger.Warnf("Received message for unknown subscription: %s", path)
 		return
 	}
 
@@ -277,20 +250,25 @@ func (m *Manager) handleObserveMessage(path string, coapMsg *mux.Message) {
 	// Convert CoAP message to Benthos message
 	msg, err := m.converter.CoAPToMessage(coapMsg.Message)
 	if err != nil {
-		m.logger.Error("Failed to convert CoAP message", "path", path, "error", err)
+		m.logger.Errorf("Failed to convert CoAP message for path %s: %v", path, err)
 		return
 	}
 
 	// Add metadata
 	msg.MetaSet("coap_path", path)
 	msg.MetaSet("coap_token", string(coapMsg.Token()))
-	msg.MetaSet("coap_observe", fmt.Sprintf("%d", coapMsg.Options().Observe()))
+	observeVal, err := coapMsg.Options().Observe()
+	if err == nil {
+		msg.MetaSet("coap_observe", fmt.Sprintf("%d", observeVal))
+	} else {
+		msg.MetaSet("coap_observe", "unknown")
+	}
 
 	select {
 	case m.msgChan <- msg:
 		// Message queued successfully
 	default:
-		m.logger.Warn("Message channel full, dropping message", "path", path)
+		m.logger.Warnf("Message channel full, dropping message for path: %s", path)
 	}
 }
 
@@ -330,7 +308,7 @@ func (m *Manager) Close() error {
 	m.mu.Lock()
 	for path, sub := range m.subscriptions {
 		sub.cancel()
-		m.logger.Debug("Cancelled subscription", "path", path)
+		m.logger.Debug(fmt.Sprintf("Cancelled subscription for path: %s", path))
 	}
 	m.mu.Unlock()
 
@@ -368,105 +346,4 @@ func (m *Manager) HealthStatus() map[string]interface{} {
 	}
 
 	return status
-}
-
-// Circuit Breaker Implementation
-func NewCircuitBreaker(config CircuitConfig) *CircuitBreaker {
-	if !config.Enabled {
-		return &CircuitBreaker{state: CircuitClosed, config: config}
-	}
-
-	return &CircuitBreaker{
-		state:  CircuitClosed,
-		config: config,
-	}
-}
-
-func (cb *CircuitBreaker) CanExecute() bool {
-	if !cb.config.Enabled {
-		return true
-	}
-
-	cb.mu.RLock()
-	defer cb.mu.RUnlock()
-
-	switch cb.state {
-	case CircuitClosed:
-		return true
-	case CircuitOpen:
-		return time.Since(cb.lastFailureTime) >= cb.config.Timeout
-	case CircuitHalfOpen:
-		return atomic.LoadInt32(&cb.halfOpenCalls) < int32(cb.config.HalfOpenMaxCalls)
-	default:
-		return false
-	}
-}
-
-func (cb *CircuitBreaker) RecordSuccess() {
-	if !cb.config.Enabled {
-		return
-	}
-
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
-	switch cb.state {
-	case CircuitClosed:
-		atomic.StoreInt32(&cb.failures, 0)
-	case CircuitHalfOpen:
-		atomic.AddInt32(&cb.successes, 1)
-		if atomic.LoadInt32(&cb.successes) >= int32(cb.config.SuccessThreshold) {
-			cb.state = CircuitClosed
-			atomic.StoreInt32(&cb.failures, 0)
-			atomic.StoreInt32(&cb.successes, 0)
-			atomic.StoreInt32(&cb.halfOpenCalls, 0)
-		}
-	}
-}
-
-func (cb *CircuitBreaker) RecordFailure() {
-	if !cb.config.Enabled {
-		return
-	}
-
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
-	atomic.AddInt32(&cb.failures, 1)
-	cb.lastFailureTime = time.Now()
-
-	switch cb.state {
-	case CircuitClosed:
-		if atomic.LoadInt32(&cb.failures) >= int32(cb.config.FailureThreshold) {
-			cb.state = CircuitOpen
-		}
-	case CircuitHalfOpen:
-		cb.state = CircuitOpen
-		atomic.StoreInt32(&cb.successes, 0)
-		atomic.StoreInt32(&cb.halfOpenCalls, 0)
-	}
-}
-
-func (cb *CircuitBreaker) State() string {
-	if !cb.config.Enabled {
-		return "disabled"
-	}
-
-	cb.mu.RLock()
-	defer cb.mu.RUnlock()
-
-	switch cb.state {
-	case CircuitClosed:
-		return "closed"
-	case CircuitOpen:
-		if time.Since(cb.lastFailureTime) >= cb.config.Timeout {
-			cb.state = CircuitHalfOpen
-			return "half-open"
-		}
-		return "open"
-	case CircuitHalfOpen:
-		return "half-open"
-	default:
-		return "unknown"
-	}
 }

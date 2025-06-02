@@ -327,7 +327,7 @@ func (i *Input) Connect(ctx context.Context) error {
 	}
 	i.mu.RUnlock()
 
-	i.logger.Info("Starting CoAP input", "endpoints", i.connManager)
+	i.logger.Info(fmt.Sprintf("Starting CoAP input with endpoints: %v", i.connManager.Config().Endpoints))
 
 	// Start observer manager
 	if err := i.obsManager.Start(); err != nil {
@@ -344,7 +344,7 @@ func (i *Input) Connect(ctx context.Context) error {
 func (i *Input) forwardMessages() {
 	defer func() {
 		if r := recover(); r != nil {
-			i.logger.Error("Message forwarding panic", "panic", r)
+			i.logger.Error(fmt.Sprintf("Message forwarding panic: %v", r))
 		}
 	}()
 
@@ -383,7 +383,7 @@ func (i *Input) Read(ctx context.Context) (*service.Message, service.AckFunc, er
 	case msg := <-i.msgChan:
 		return msg, func(ctx context.Context, err error) error {
 			if err != nil {
-				i.logger.Error("Message processing failed", "error", err)
+				i.logger.Error(fmt.Sprintf("Message processing failed: %v", err))
 				i.metrics.ErrorsTotal.Incr(1)
 			}
 			return nil
@@ -409,12 +409,12 @@ func (i *Input) Close(ctx context.Context) error {
 
 		// Close observer manager
 		if err := i.obsManager.Close(); err != nil {
-			i.logger.Error("Failed to close observer manager", "error", err)
+			i.logger.Error(fmt.Sprintf("Failed to close observer manager: %v", err))
 		}
 
 		// Close connection manager
 		if err := i.connManager.Close(); err != nil {
-			i.logger.Error("Failed to close connection manager", "error", err)
+			i.logger.Error(fmt.Sprintf("Failed to close connection  manager: %v", err))
 		}
 
 		// Drain remaining messages

@@ -57,40 +57,40 @@ func NewManager(resources *service.Resources) *Manager {
 		resources: resources,
 
 		// Connection metrics
-		ConnectionsActive:  resources.MetricCounter("coap_connections_active"),
-		ConnectionsCreated: resources.MetricCounter("coap_connections_created_total"),
-		ConnectionsFailed:  resources.MetricCounter("coap_connections_failed_total"),
-		ConnectionPoolSize: resources.MetricGauge("coap_connection_pool_size"),
+		ConnectionsActive:  resources.Metrics().NewCounter("coap_connections_active"),
+		ConnectionsCreated: resources.Metrics().NewCounter("coap_connections_created_total"),
+		ConnectionsFailed:  resources.Metrics().NewCounter("coap_connections_failed_total"),
+		ConnectionPoolSize: resources.Metrics().NewGauge("coap_connection_pool_size"),
 
 		// Input metrics
-		InputMessagesRead:    resources.MetricCounter("coap_input_messages_read_total"),
-		InputMessagesDropped: resources.MetricCounter("coap_input_messages_dropped_total"),
-		InputErrors:          resources.MetricCounter("coap_input_errors_total"),
-		InputLatency:         resources.MetricTimer("coap_input_latency_seconds"),
+		InputMessagesRead:    resources.Metrics().NewCounter("coap_input_messages_read_total"),
+		InputMessagesDropped: resources.Metrics().NewCounter("coap_input_messages_dropped_total"),
+		InputErrors:          resources.Metrics().NewCounter("coap_input_errors_total"),
+		InputLatency:         resources.Metrics().NewTimer("coap_input_latency_seconds"),
 
 		// Output metrics
-		OutputMessagesSent:   resources.MetricCounter("coap_output_messages_sent_total"),
-		OutputMessagesFailed: resources.MetricCounter("coap_output_messages_failed_total"),
-		OutputRequests:       resources.MetricCounter("coap_output_requests_total"),
-		OutputLatency:        resources.MetricTimer("coap_output_latency_seconds"),
+		OutputMessagesSent:   resources.Metrics().NewCounter("coap_output_messages_sent_total"),
+		OutputMessagesFailed: resources.Metrics().NewCounter("coap_output_messages_failed_total"),
+		OutputRequests:       resources.Metrics().NewCounter("coap_output_requests_total"),
+		OutputLatency:        resources.Metrics().NewTimer("coap_output_latency_seconds"),
 
 		// Observer metrics
-		ObservationsActive:   resources.MetricGauge("coap_observations_active"),
-		ObservationsTotal:    resources.MetricCounter("coap_observations_total"),
-		ObservationsFailed:   resources.MetricCounter("coap_observations_failed_total"),
-		ResubscriptionsTotal: resources.MetricCounter("coap_resubscriptions_total"),
+		ObservationsActive:   resources.Metrics().NewGauge("coap_observations_active"),
+		ObservationsTotal:    resources.Metrics().NewCounter("coap_observations_total"),
+		ObservationsFailed:   resources.Metrics().NewCounter("coap_observations_failed_total"),
+		ResubscriptionsTotal: resources.Metrics().NewCounter("coap_resubscriptions_total"),
 
 		// Circuit breaker metrics
-		CircuitBreakerOpen:  resources.MetricCounter("coap_circuit_breaker_open_total"),
-		CircuitBreakerState: resources.MetricGauge("coap_circuit_breaker_state"),
+		CircuitBreakerOpen:  resources.Metrics().NewCounter("coap_circuit_breaker_open_total"),
+		CircuitBreakerState: resources.Metrics().NewGauge("coap_circuit_breaker_state"),
 
 		// Health metrics
-		HealthChecksTotal:  resources.MetricCounter("coap_health_checks_total"),
-		HealthChecksFailed: resources.MetricCounter("coap_health_checks_failed_total"),
+		HealthChecksTotal:  resources.Metrics().NewCounter("coap_health_checks_total"),
+		HealthChecksFailed: resources.Metrics().NewCounter("coap_health_checks_failed_total"),
 
 		// Performance metrics
-		MessageProcessingDuration: resources.MetricTimer("coap_message_processing_duration_seconds"),
-		PayloadSize:               resources.MetricGauge("coap_payload_size_bytes"),
+		MessageProcessingDuration: resources.Metrics().NewTimer("coap_message_processing_duration_seconds"),
+		PayloadSize:               resources.Metrics().NewGauge("coap_payload_size_bytes"),
 	}
 }
 

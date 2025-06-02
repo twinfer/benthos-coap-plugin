@@ -146,7 +146,7 @@ func (p *ConnectionPool) createConnection() (*ConnectionWrapper, error) {
 	atomic.AddInt32(&p.currentSize, 1)
 	p.metrics.PoolSize.Incr(1)
 
-	p.logger.Debug("Created new connection", "endpoint", p.endpoint, "pool_size", atomic.LoadInt32(&p.currentSize))
+	p.logger.Debug(fmt.Sprintf("Created new connection: endpoint=%s pool_size=%d", p.endpoint, atomic.LoadInt32(&p.currentSize)))
 	return wrapper, nil
 }
 
@@ -159,7 +159,7 @@ func (p *ConnectionPool) closeConnection(conn *ConnectionWrapper) {
 	atomic.AddInt32(&p.currentSize, -1)
 	p.metrics.PoolSize.Incr(-1)
 
-	p.logger.Debug("Closed connection", "endpoint", p.endpoint, "pool_size", atomic.LoadInt32(&p.currentSize))
+	p.logger.Debug(fmt.Sprintf("Closed connection: endpoint=%s pool_size=%d", p.endpoint, atomic.LoadInt32(&p.currentSize)))
 }
 
 func (p *ConnectionPool) healthChecker() {
@@ -190,10 +190,9 @@ func (p *ConnectionPool) performHealthCheck() {
 
 			if atomic.LoadInt32(&conn.inUse) == 0 {
 				if err := p.factory.Validate(conn.conn); err != nil {
-					p.logger.Debug("Connection failed health check",
-						"endpoint", p.endpoint,
-						"error", err,
-						"connection_age", time.Since(conn.createdAt))
+					p.logger.Debug(fmt.Sprintf(
+						"Connection failed health check: endpoint=%s error=%v connection_age=%v",
+						p.endpoint, err, time.Since(conn.createdAt)))
 
 					atomic.StoreInt32(&conn.healthy, 0)
 					p.closeConnection(conn)
@@ -222,11 +221,10 @@ func (p *ConnectionPool) performHealthCheck() {
 	}
 
 	if failedCount > 0 {
-		p.logger.Warn("Health check completed",
-			"endpoint", p.endpoint,
-			"checked", checkedCount,
-			"failed", failedCount,
-			"pool_size", atomic.LoadInt32(&p.currentSize))
+		p.logger.Warn(fmt.Sprintf(
+			"Health check completed: endpoint=%s checked=%d failed=%d pool_size=%d",
+			p.endpoint, checkedCount, failedCount, atomic.LoadInt32(&p.currentSize),
+		))
 	}
 }
 
@@ -243,7 +241,7 @@ func (p *ConnectionPool) Close() error {
 		p.closeConnection(conn)
 	}
 
-	p.logger.Info("Connection pool closed", "endpoint", p.endpoint)
+	p.logger.Info(fmt.Sprintf("Connection pool closed (endpoint=%s)", p.endpoint))
 	return nil
 }
 
