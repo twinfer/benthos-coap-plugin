@@ -222,7 +222,14 @@ func validateFileExists(filename string) error {
 	if err != nil {
 		return fmt.Errorf("file is not readable: %s (%w)", expanded, err)
 	}
-	file.Close()
+	defer file.Close()
+
+	// Attempt to read at least one byte
+	buffer := make([]byte, 1)
+	_, err = file.Read(buffer)
+	if err != nil && err.Error() != "EOF" { // EOF is acceptable for empty files
+		return fmt.Errorf("error reading file %s: %w", expanded, err)
+	}
 
 	return nil
 }
