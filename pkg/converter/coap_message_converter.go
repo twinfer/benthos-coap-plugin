@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"compress/zlib"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -89,12 +91,22 @@ func (c *Converter) MessageToCoAP(msg *service.Message) (*message.Message, error
 	method := c.getMethodFromMetadata(msg)
 	coapMsg.Code = method
 
-	// Set content format - we'll need to handle this through Options
-	_, err := c.determineContentFormat(msg)
+	// Set content format
+	contentFormatValue, err := c.determineContentFormat(msg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine content format: %w", err)
 	}
-	// TODO: Set content format through Options with proper buffer management
+	// Set the ContentFormat option on the CoAP message
+	// If no specific format is determined (e.g. AppOctets is default), it might be omitted
+	// or explicitly set depending on desired behavior. go-coap typically defaults to
+	// no format or application/octet-stream if payload is present but no format is set.
+	// For clarity and to ensure what Benthos determined is sent, we set it.
+	if err := coapMsg.SetOptionUint32(message.ContentFormat, contentFormatValue); err != nil {
+		// This error might occur if the option ID is invalid or value is out of range,
+		// though unlikely for standard ContentFormat.
+		c.logger.Warnf("Failed to set CoAP ContentFormat option: %v", err)
+		// Depending on strictness, might return error: return nil, fmt.Errorf("failed to set content format option: %w", err)
+	}
 
 	// Set payload
 	payload, err := msg.AsBytes()
@@ -344,40 +356,202 @@ func (c *Converter) mimeTypeToContentFormat(mimeType string) uint32 {
 }
 
 func (c *Converter) addOptionsFromMetadata(coapMsg *message.Message, msg *service.Message) {
-	// Note: go-coap v3 requires buffer-based option setting which is complex
-	// For now, we'll implement a simplified version using the higher-level methods
-
-	// URI Path - use SetPath if available
+	// Handle explicitly set URI path
 	if uriPath, exists := msg.MetaGet("coap_uri_path"); exists {
-		path := strings.Trim(uriPath, "/")
-		if path != "" {
-			// In go-coap v3, we would need to use Options.SetPath with a buffer
-			// For now, we'll skip complex option setting
-			c.logger.Debug(fmt.Sprintf("Would set URI path: %s", path))
+		if err := coapMsg.SetPathString(strings.Trim(uriPath, "/")); err != nil {
+			c.logger.Warnf("Failed to set CoAP URI Path from 'coap_uri_path' metadata: %v", err)
 		}
 	}
 
-	// For other options, we would need to implement buffer-based option setting
-	// This is complex in go-coap v3 and requires careful buffer management
-	// TODO: Implement proper option setting with buffers
-
-	// Log metadata for debugging
-	if uriQuery, exists := msg.MetaGet("coap_uri_query"); exists {
-		c.logger.Debug(fmt.Sprintf("Would set URI query: %s", uriQuery))
+	// Handle explicitly set URI query
+	if uriQueryStr, exists := msg.MetaGet("coap_uri_query"); exists {
+		queries := strings.Split(uriQueryStr, "&")
+		for _, q := range queries {
+			if err := coapMsg.AddOptionString(message.URIQuery, q); err != nil {
+				c.logger.Warnf("Failed to add CoAP URI Query from 'coap_uri_query' metadata: %v", err)
+			}
+		}
 	}
-	if maxAge, exists := msg.MetaGet("coap_max_age"); exists {
-		c.logger.Debug(fmt.Sprintf("Would set max age: %s", maxAge))
+
+	// Max-Age
+	if maxAgeStr, exists := msg.MetaGet("coap_max_age"); exists {
+		if maxAgeVal, err := strconv.ParseUint(maxAgeStr, 10, 32); err == nil {
+			if err := coapMsg.SetOptionUint32(message.MaxAge, uint32(maxAgeVal)); err != nil {
+				c.logger.Warnf("Failed to set CoAP Max-Age option from metadata: %v", err)
+			}
+		} else {
+			c.logger.Warnf("Failed to parse 'coap_max_age' metadata value '%s' as uint32: %v", maxAgeStr, err)
+		}
+	}
+
+	// ETag
+	if etagStr, exists := msg.MetaGet("coap_etag"); exists {
+		// Assuming ETag in metadata is a direct string. If it can be hex, add decoding.
+		if err := coapMsg.SetOptionBytes(message.ETag, []byte(etagStr)); err != nil { // ETag is typically a single option in requests
+			c.logger.Warnf("Failed to set CoAP ETag option from metadata: %v", err)
+		}
+	}
+
+	// Observe
+	if obsReqStr, exists := msg.MetaGet("coap_observe_request"); exists {
+		val := strings.ToLower(obsReqStr)
+		var obsVal uint32
+		setObs := true
+		if val == "register" || val == "0" {
+			obsVal = 0 // Register
+		} else if val == "deregister" || val == "1" {
+			obsVal = 1 // Deregister
+		} else {
+			setObs = false
+			c.logger.Warnf("Invalid value for 'coap_observe_request': %s. Expected 'register', 'deregister', '0', or '1'.", obsReqStr)
+		}
+		if setObs {
+			if err := coapMsg.SetOptionUint32(message.Observe, obsVal); err != nil {
+				c.logger.Warnf("Failed to set CoAP Observe option from metadata: %v", err)
+			}
+		}
+	}
+
+	// Accept
+	if acceptStr, exists := msg.MetaGet("coap_accept"); exists {
+		if acceptVal, err := strconv.ParseUint(acceptStr, 10, 16); err == nil { // Accept option is uint16 in some contexts, but go-coap uses uint32 for SetOptionUint32
+			if err := coapMsg.SetOptionUint32(message.Accept, uint32(acceptVal)); err != nil {
+				c.logger.Warnf("Failed to set CoAP Accept option from metadata: %v", err)
+			}
+		} else {
+			c.logger.Warnf("Failed to parse 'coap_accept' metadata value '%s' as uint16/uint32: %v", acceptStr, err)
+		}
+	}
+
+	// If-Match
+	if ifMatchStr, exists := msg.MetaGet("coap_if_match"); exists {
+		// Assuming If-Match in metadata is a hex-encoded string.
+		// CoAP spec allows multiple If-Match options.
+		decodedVal, err := hex.DecodeString(ifMatchStr)
+		if err == nil {
+			if err := coapMsg.AddOptionBytes(message.IfMatch, decodedVal); err != nil {
+				c.logger.Warnf("Failed to set CoAP If-Match option from metadata: %v", err)
+			}
+		} else {
+			c.logger.Warnf("Failed to hex-decode 'coap_if_match' metadata value '%s': %v", ifMatchStr, err)
+		}
+	}
+	// To support multiple If-Match values from metadata, one might use "coap_if_match_0", "coap_if_match_1"
+	// or a JSON array string. For simplicity, current handles one hex string.
+
+	// If-None-Match
+	if _, exists := msg.MetaGet("coap_if_none_match"); exists {
+		// The presence of the key indicates the option should be set. It's a zero-byte option.
+		if err := coapMsg.SetOptionBytes(message.IfNoneMatch, []byte{}); err != nil {
+			c.logger.Warnf("Failed to set CoAP If-None-Match option from metadata: %v", err)
+		}
+	}
+
+	// Logic for restoring options preserved by preserveAllOptions (if enabled)
+	// This runs after specific options are handled, allowing specific metadata to take precedence
+	// if an option (like ETag) was also somehow in generic preserved options.
+	// However, preserveAllOptions is designed to skip these specific IDs, so direct conflict is unlikely.
+	if c.config.PreserveOptions {
+		type preservedOption struct {
+			ID    message.OptionID
+			Index int
+			Value []byte // Raw byte value after hex decoding
+		}
+		var optionsToRestore []preservedOption
+
+		msg.MetaWalk(func(k string, v any) error {
+			if strings.HasPrefix(k, "coap_option_") {
+				var optID uint16
+				var optIndex int
+				// Example key: coap_option_270_0 (Option ID 270, index 0)
+				n, err := fmt.Sscanf(k, "coap_option_%d_%d", &optID, &optIndex)
+				if err == nil && n == 2 {
+					// Ensure this option ID is not one handled by specific metadata fields above,
+					// to avoid adding it twice if it somehow slipped through preserveAllOptions' skip logic
+					// or if user manually set both coap_etag and coap_option_4_0.
+					// The specific handlers above should take precedence.
+					switch message.OptionID(optID) {
+					case message.URIPath, message.URIQuery, message.ContentFormat, message.MaxAge, message.ETag, message.Observe, message.Accept, message.IfMatch, message.IfNoneMatch:
+						// These are handled by specific metadata keys above.
+						// If they are found here, it means preserveAllOptions might not have skipped them,
+						// or user set them manually. We prefer the specific handler's value.
+						// However, preserveAllOptions IS designed to skip these.
+						// This check is an extra safeguard.
+						c.logger.Debugf("Skipping restore of generic coap_option_%d_%d as it's handled by specific metadata.", optID, optIndex)
+						return nil
+					}
+
+					valStr, ok := v.(string)
+					if !ok {
+						c.logger.Warnf("Metadata value for key %s is not a string, skipping", k)
+						return nil
+					}
+					decodedVal, decodeErr := hex.DecodeString(valStr)
+					if decodeErr != nil {
+						c.logger.Warnf("Failed to hex-decode metadata value for key %s: %v", k, decodeErr)
+						return nil
+					}
+					optionsToRestore = append(optionsToRestore, preservedOption{
+						ID:    message.OptionID(optID),
+						Index: optIndex,
+						Value: decodedVal,
+					})
+				}
+			}
+			return nil
+		})
+
+		// Sort options by ID and then by Index to ensure correct order of addition
+		sort.Slice(optionsToRestore, func(i, j int) bool {
+			if optionsToRestore[i].ID != optionsToRestore[j].ID {
+				return optionsToRestore[i].ID < optionsToRestore[j].ID
+			}
+			return optionsToRestore[i].Index < optionsToRestore[j].Index
+		})
+
+		for _, opt := range optionsToRestore {
+			if err := coapMsg.AddOptionBytes(opt.ID, opt.Value); err != nil {
+				c.logger.Warnf("Failed to restore CoAP option ID %d (Index %d) from metadata: %v", opt.ID, opt.Index, err)
+			} else {
+				c.logger.Debugf("Restored generic CoAP option ID %d (Index %d) from metadata", opt.ID, opt.Index)
+			}
+		}
 	}
 }
 
 func (c *Converter) preserveAllOptions(msg *service.Message, coapMsg *message.Message) {
-	options := make(map[string]interface{})
+	if !c.config.PreserveOptions {
+		return
+	}
 
-	// Note: In go-coap v3, Options is a slice, not something that supports Visit()
-	// We'll need a different approach to preserve all options
-	// For now, we'll skip this functionality
-	// TODO: Implement option preservation for go-coap v3
-	_ = options // Avoid unused variable warning
+	// Keep track of how many times we've seen an option ID to create unique metadata keys
+	optionCounts := make(map[message.OptionID]int)
+
+	for _, opt := range coapMsg.Options {
+		// Skip options that are typically handled by specific fields/logic,
+		// to avoid redundancy or conflict if they are also restored generically.
+		// Users can get these from their specific metadata fields like coap_uri_path, coap_content_format.
+		switch opt.ID {
+		case message.URIPath, message.URIQuery, message.ContentFormat, message.LocationPath, message.Observe, message.MaxAge, message.ETag:
+			// These are already explicitly extracted in addCoAPMetadata or handled elsewhere.
+			// If we also save them here, during restoration (Part 2) we might add them twice
+			// or cause conflicts if the specific metadata (e.g. "coap_uri_path") was modified.
+			// So, we skip them from generic preservation.
+			continue
+		}
+
+
+		baseKey := fmt.Sprintf("coap_option_%d", opt.ID)
+		occurrence := optionCounts[opt.ID]
+		optionCounts[opt.ID]++ // Increment for next time
+
+		// Create a unique key for each occurrence of an option
+		metaKey := fmt.Sprintf("%s_%d", baseKey, occurrence)
+		metaValue := hex.EncodeToString(opt.Value)
+
+		msg.MetaSet(metaKey, metaValue)
+		c.logger.Debugf("Preserved CoAP option %s (ID: %d, Occurrence: %d) as metadata key '%s'", c.getOptionName(opt.ID), opt.ID, occurrence, metaKey)
+	}
 }
 
 func (c *Converter) getOptionName(optionID message.OptionID) string {

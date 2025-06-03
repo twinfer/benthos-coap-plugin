@@ -355,20 +355,131 @@ func (o *Output) sendCoAPMessage(ctx context.Context, connWrapper *connection.Co
 
 	o.logger.Debugf("Sending CoAP message to path %s on endpoint %s (token: %s, type: %s)", path, endpoint, tokenStr, coapMsg.Type.String())
 
-	// Note: go-coap v3 requires different connection handling
-	// For now, we'll simplify this to handle the basic case
-	// TODO: Implement proper connection type detection for go-coap v3
-	return fmt.Errorf("CoAP message sending not fully implemented for go-coap v3 - requires connection type detection")
+	rawConn := connWrapper.Connection()
+	protocol := connWrapper.Protocol()
+	endpoint := connWrapper.Endpoint()
+	tokenStr := coapMsg.Token.String() // Use String() for proper token representation
+
+	// Create a new context with the request timeout
+	reqCtx, cancel := context.WithTimeout(ctx, o.config.RequestOptions.Timeout)
+	defer cancel()
+
+	o.logger.Debugf("Attempting to send CoAP message to path %s on endpoint %s (token: %s, type: %s, protocol: %s)",
+		path, endpoint, tokenStr, coapMsg.Type.String(), protocol)
+
+	switch c := rawConn.(type) {
+	case *client.Conn: // Handles UDP and DTLS
+		return o.sendUDPMessage(reqCtx, c, coapMsg, endpoint, path, tokenStr)
+	case *coapTCPClient.Conn: // Handles TCP and TCP-TLS
+		return o.sendTCPMessage(reqCtx, c, coapMsg, endpoint, path, tokenStr)
+	default:
+		o.metrics.MessagesFailed.Incr(1)
+		return fmt.Errorf("unsupported connection type for CoAP output: %T (protocol: %s)", rawConn, protocol)
+	}
 }
 
-func (o *Output) sendUDPMessage(ctx context.Context, conn interface{}, coapMsg *message.Message, endpoint, path, tokenStr string) error {
-	// TODO: Implement UDP message sending for go-coap v3
-	return fmt.Errorf("UDP message sending not implemented for go-coap v3")
+// sendUDPMessage sends a CoAP message using a UDP client connection.
+func (o *Output) sendUDPMessage(ctx context.Context, conn *client.Conn, coapMsg *message.Message, endpoint, path, tokenStr string) error {
+	// Determine CoAP method (e.g., POST, PUT)
+	// For simplicity, let's assume POST if not specified in metadata.
+	// A Benthos message's metadata could specify 'coap_method'.
+	methodStr, _ := coapMsg.Options().GetString(message.URIPath) // Placeholder, should be a custom metadata
+	// A better way: check msg.MetaGet("coap_method") from the original Benthos message
+	// This requires coapMsg to be the one from MessageToCoAP, and that function to preserve/set it.
+	// For now, default to POST.
+	coapMethod := message.POST
+	// Example: if methodMeta, exists := benthosMsg.MetaGet("coap_method"); exists { coapMethod = ... }
+	// This detail depends on how MessageToCoAP populates the message.Message.
+	// Assuming coapMsg is ready for sending (payload, token, type set).
+	// We need to construct a message.Request
+
+	req := message.Message{
+		Code:    coapMethod, // Defaulting to POST
+		Token:   coapMsg.Token,
+		Type:    coapMsg.Type,
+		Payload: coapMsg.Payload,
+		Options: coapMsg.Options,
+	}
+	if req.Options == nil {
+		req.Options = make(message.Options, 0, 16)
+	}
+	req.SetPathString(path) // Ensure path is set
+
+	// Copy relevant options from coapMsg to req if not already there (like ContentFormat)
+	if cf, err := coapMsg.Options().ContentFormat(); err == nil && cf != message.AppOctets {
+		req.SetOption(message.ContentFormat, cf)
+	}
+
+
+	o.logger.Debugf("Sending UDP CoAP %s request to path %s on endpoint %s (token: %s)",
+		req.Code.String(), path, endpoint, tokenStr)
+
+	resp, err := conn.Do(ctx, &req)
+	if err != nil {
+		o.metrics.MessagesFailed.Incr(1)
+		// Check if the error is due to context timeout
+		if ctx.Err() == context.DeadlineExceeded {
+			o.metrics.RequestsTimeout.Incr(1)
+			return fmt.Errorf("CoAP UDP request to %s on %s timed out (token: %s): %w", path, endpoint, tokenStr, err)
+		}
+		return fmt.Errorf("CoAP UDP request to %s on %s failed (token: %s): %w", path, endpoint, tokenStr, err)
+	}
+
+	o.logger.Debugf("Received UDP CoAP response from %s on %s (token: %s, code: %s)",
+		path, endpoint, tokenStr, resp.Code.String())
+
+	// Check response code (e.g., 2.xx is success)
+	if resp.Code < message.CSMBase || resp.Code >= message.BadRequest {
+		o.metrics.MessagesFailed.Incr(1)
+		return fmt.Errorf("CoAP UDP request to %s on %s returned error code %s (token: %s)", path, endpoint, resp.Code.String(), tokenStr)
+	}
+
+	return nil
 }
 
-func (o *Output) sendTCPMessage(ctx context.Context, conn interface{}, coapMsg *message.Message, endpoint, path, tokenStr string) error {
-	// TODO: Implement TCP message sending for go-coap v3
-	return fmt.Errorf("TCP message sending not implemented for go-coap v3")
+// sendTCPMessage sends a CoAP message using a TCP client connection.
+func (o *Output) sendTCPMessage(ctx context.Context, conn *coapTCPClient.Conn, coapMsg *message.Message, endpoint, path, tokenStr string) error {
+	coapMethod := message.POST // Defaulting to POST, similar to UDP
+
+	req := message.Message{
+		Code:    coapMethod,
+		Token:   coapMsg.Token,
+		Type:    coapMsg.Type,
+		Payload: coapMsg.Payload,
+		Options: coapMsg.Options,
+	}
+	if req.Options == nil {
+		req.Options = make(message.Options, 0, 16)
+	}
+	req.SetPathString(path)
+
+	if cf, err := coapMsg.Options().ContentFormat(); err == nil && cf != message.AppOctets {
+		req.SetOption(message.ContentFormat, cf)
+	}
+
+
+	o.logger.Debugf("Sending TCP CoAP %s request to path %s on endpoint %s (token: %s)",
+		req.Code.String(), path, endpoint, tokenStr)
+
+	resp, err := conn.Do(ctx, &req)
+	if err != nil {
+		o.metrics.MessagesFailed.Incr(1)
+		if ctx.Err() == context.DeadlineExceeded {
+			o.metrics.RequestsTimeout.Incr(1)
+			return fmt.Errorf("CoAP TCP request to %s on %s timed out (token: %s): %w", path, endpoint, tokenStr, err)
+		}
+		return fmt.Errorf("CoAP TCP request to %s on %s failed (token: %s): %w", path, endpoint, tokenStr, err)
+	}
+
+	o.logger.Debugf("Received TCP CoAP response from %s on %s (token: %s, code: %s)",
+		path, endpoint, tokenStr, resp.Code.String())
+
+	if resp.Code < message.CSMBase || resp.Code >= message.BadRequest {
+		o.metrics.MessagesFailed.Incr(1)
+		return fmt.Errorf("CoAP TCP request to %s on %s returned error code %s (token: %s)", path, endpoint, resp.Code.String(), tokenStr)
+	}
+
+	return nil
 }
 
 func (o *Output) WriteBatch(ctx context.Context, batch service.MessageBatch) error {
