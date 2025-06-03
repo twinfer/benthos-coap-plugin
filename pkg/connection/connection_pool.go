@@ -283,3 +283,11 @@ func (c *ConnectionWrapper) IsHealthy() bool {
 func (c *ConnectionWrapper) IsInUse() bool {
 	return atomic.LoadInt32(&c.inUse) == 1
 }
+
+func (c *ConnectionWrapper) Endpoint() string {
+	return c.endpoint
+}
+
+func (c *ConnectionWrapper) Connection() interface{} {
+	return c.conn
+}

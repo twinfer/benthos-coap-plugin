@@ -3,6 +3,7 @@ module github.com/twinfer/benthos-coap-plugin
 go 1.24.3
 
 require (
+	github.com/pion/dtls/v3 v3.0.2
 	github.com/plgd-dev/go-coap/v3 v3.3.6
 	github.com/redpanda-data/benthos/v4 v4.52.0
 	github.com/redpanda-data/connect/public/bundle/free/v4 v4.49.1
@@ -267,7 +268,6 @@ require (
 	github.com/pierrec/lz4 v2.6.1+incompatible // indirect
 	github.com/pierrec/lz4/v4 v4.1.22 // indirect
 	github.com/pinecone-io/go-pinecone v1.1.1 // indirect
-	github.com/pion/dtls/v3 v3.0.2 // indirect
 	github.com/pion/logging v0.2.2 // indirect
 	github.com/pion/transport/v3 v3.0.7 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect

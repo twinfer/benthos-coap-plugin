@@ -45,7 +45,7 @@ func CalculateBackoff(retryCount int, config BackoffConfig) time.Duration {
 		// Let's use a slightly more standard Go random source for jitter.
 		r := rand.New(rand.NewSource(time.Now().UnixNano()))
 		jitterMultiplier := config.Multiplier * 0.25 // Max jitter is 25% of the current delay
-		randomFactor := (r.Float64() * 2) - 1 // random number between -1.0 and 1.0
+		randomFactor := (r.Float64() * 2) - 1        // random number between -1.0 and 1.0
 		jitter := delay * jitterMultiplier * randomFactor
 		delay += jitter
 	}
@@ -63,7 +63,6 @@ func CalculateBackoff(retryCount int, config BackoffConfig) time.Duration {
 			delay = 100 * float64(time.Millisecond) // Absolute minimum if InitialInterval is also 0
 		}
 	}
-
 
 	return time.Duration(delay)
 }

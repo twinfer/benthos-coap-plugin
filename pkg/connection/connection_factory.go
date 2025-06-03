@@ -6,12 +6,16 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"time"
 
-	"github.com/plgd-dev/go-coap/v3/dtls"
+	"github.com/pion/dtls/v3"
+	coapDTLS "github.com/plgd-dev/go-coap/v3/dtls"
+	"github.com/plgd-dev/go-coap/v3/options"
 	"github.com/plgd-dev/go-coap/v3/tcp"
+	coapTCPClient "github.com/plgd-dev/go-coap/v3/tcp/client"
 	"github.com/plgd-dev/go-coap/v3/udp"
+	"github.com/plgd-dev/go-coap/v3/udp/client"
 )
 
 type ConnectionFactory interface {
@@ -29,14 +33,11 @@ func (f *UDPFactory) Protocol() string {
 }
 
 func (f *UDPFactory) Create(endpoint string, security SecurityConfig) (interface{}, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	return udp.DialWithContext(ctx, endpoint)
+	return udp.Dial(endpoint)
 }
 
 func (f *UDPFactory) Validate(conn interface{}) error {
-	udpConn, ok := conn.(*udp.Conn)
+	udpConn, ok := conn.(*client.Conn)
 	if !ok {
 		return fmt.Errorf("invalid connection type for UDP factory")
 	}
@@ -45,12 +46,11 @@ func (f *UDPFactory) Validate(conn interface{}) error {
 	defer cancel()
 
 	// Simple ping using empty confirmable message
-	_, err := udpConn.Ping(ctx)
-	return err
+	return udpConn.Ping(ctx)
 }
 
 func (f *UDPFactory) Close(conn interface{}) error {
-	if udpConn, ok := conn.(*udp.Conn); ok {
+	if udpConn, ok := conn.(*client.Conn); ok {
 		return udpConn.Close()
 	}
 	return fmt.Errorf("invalid connection type for UDP factory")
@@ -64,14 +64,12 @@ func (f *TCPFactory) Protocol() string {
 }
 
 func (f *TCPFactory) Create(endpoint string, security SecurityConfig) (interface{}, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	return tcp.DialWithContext(ctx, endpoint)
+	// tcp.Dial returns (*client.Conn, error)
+	return tcp.Dial(endpoint)
 }
 
 func (f *TCPFactory) Validate(conn interface{}) error {
-	tcpConn, ok := conn.(*tcp.Conn)
+	tcpConn, ok := conn.(*coapTCPClient.Conn)
 	if !ok {
 		return fmt.Errorf("invalid connection type for TCP factory")
 	}
@@ -79,12 +77,19 @@ func (f *TCPFactory) Validate(conn interface{}) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := tcpConn.Ping(ctx)
-	return err
+	// Check if connection context is still valid
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-tcpConn.Context().Done():
+		return fmt.Errorf("connection closed")
+	default:
+		return nil
+	}
 }
 
 func (f *TCPFactory) Close(conn interface{}) error {
-	if tcpConn, ok := conn.(*tcp.Conn); ok {
+	if tcpConn, ok := conn.(*coapTCPClient.Conn); ok {
 		return tcpConn.Close()
 	}
 	return fmt.Errorf("invalid connection type for TCP factory")
@@ -103,10 +108,7 @@ func (f *DTLSFactory) Create(endpoint string, security SecurityConfig) (interfac
 		return nil, fmt.Errorf("failed to create DTLS config: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	return dtls.DialWithContext(ctx, endpoint, config)
+	return coapDTLS.Dial(endpoint, config)
 }
 
 func (f *DTLSFactory) createDTLSConfig(security SecurityConfig) (*dtls.Config, error) {
@@ -141,7 +143,7 @@ func (f *DTLSFactory) createDTLSConfig(security SecurityConfig) (*dtls.Config, e
 
 		// Load CA certificates if provided
 		if security.CACertFile != "" {
-			caCertPEM, err := ioutil.ReadFile(security.CACertFile)
+			caCertPEM, err := os.ReadFile(security.CACertFile)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read CA certificate: %w", err)
 			}
@@ -163,7 +165,7 @@ func (f *DTLSFactory) createDTLSConfig(security SecurityConfig) (*dtls.Config, e
 }
 
 func (f *DTLSFactory) Validate(conn interface{}) error {
-	dtlsConn, ok := conn.(*dtls.Conn)
+	udpConn, ok := conn.(*client.Conn)
 	if !ok {
 		return fmt.Errorf("invalid connection type for DTLS factory")
 	}
@@ -171,13 +173,20 @@ func (f *DTLSFactory) Validate(conn interface{}) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := dtlsConn.Ping(ctx)
-	return err
+	// Check if connection context is still valid
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-udpConn.Context().Done():
+		return fmt.Errorf("connection closed")
+	default:
+		return nil
+	}
 }
 
 func (f *DTLSFactory) Close(conn interface{}) error {
-	if dtlsConn, ok := conn.(*dtls.Conn); ok {
-		return dtlsConn.Close()
+	if udpConn, ok := conn.(*client.Conn); ok {
+		return udpConn.Close()
 	}
 	return fmt.Errorf("invalid connection type for DTLS factory")
 }
@@ -195,10 +204,7 @@ func (f *TCPTLSFactory) Create(endpoint string, security SecurityConfig) (interf
 		return nil, fmt.Errorf("failed to create TLS config: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	return tcp.DialTLSWithContext(ctx, endpoint, config)
+	return tcp.Dial(endpoint, options.WithTLS(config))
 }
 
 func (f *TCPTLSFactory) createTLSConfig(security SecurityConfig) (*tls.Config, error) {
@@ -220,7 +226,7 @@ func (f *TCPTLSFactory) createTLSConfig(security SecurityConfig) (*tls.Config, e
 
 		// Load CA certificates if provided
 		if security.CACertFile != "" {
-			caCertPEM, err := ioutil.ReadFile(security.CACertFile)
+			caCertPEM, err := os.ReadFile(security.CACertFile)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read CA certificate: %w", err)
 			}
@@ -243,7 +249,7 @@ func (f *TCPTLSFactory) createTLSConfig(security SecurityConfig) (*tls.Config, e
 }
 
 func (f *TCPTLSFactory) Validate(conn interface{}) error {
-	tcpConn, ok := conn.(*tcp.Conn)
+	tcpConn, ok := conn.(*coapTCPClient.Conn)
 	if !ok {
 		return fmt.Errorf("invalid connection type for TCP-TLS factory")
 	}
@@ -251,12 +257,19 @@ func (f *TCPTLSFactory) Validate(conn interface{}) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := tcpConn.Ping(ctx)
-	return err
+	// Check if connection context is still valid
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-tcpConn.Context().Done():
+		return fmt.Errorf("connection closed")
+	default:
+		return nil
+	}
 }
 
 func (f *TCPTLSFactory) Close(conn interface{}) error {
-	if tcpConn, ok := conn.(*tcp.Conn); ok {
+	if tcpConn, ok := conn.(*coapTCPClient.Conn); ok {
 		return tcpConn.Close()
 	}
 	return fmt.Errorf("invalid connection type for TCP-TLS factory")

@@ -111,6 +111,12 @@ func (m *Manager) Put(conn *ConnectionWrapper) {
 	}
 }
 
+func (m *Manager) Config() Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.config
+}
+
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/redpanda-data/benthos/v4/public/service"
 
@@ -216,14 +215,14 @@ func newCoAPInput(conf *service.ParsedConfig, mgr *service.Resources) (*Input, e
 		obsManager:  obsManager,
 		converter:   conv,
 		logger:      mgr.Logger(),
-		msgChan:     make(chan *service.Message, bufferSize),
+		msgChan:     make(chan *service.Message, obsConfig.BufferSize),
 		closeChan:   make(chan struct{}),
 		metrics: &Metrics{
-			MessagesRead:    mgr.MetricCounter("coap_input_messages_read"),
-			MessagesDropped: mgr.MetricCounter("coap_input_messages_dropped"),
-			ConnectionsOpen: mgr.MetricCounter("coap_input_connections_open"),
-			ObservesActive:  mgr.MetricCounter("coap_input_observes_active"),
-			ErrorsTotal:     mgr.MetricCounter("coap_input_errors_total"),
+			MessagesRead:    mgr.Metrics().NewCounter("coap_input_messages_read"),
+			MessagesDropped: mgr.Metrics().NewCounter("coap_input_messages_dropped"),
+			ConnectionsOpen: mgr.Metrics().NewCounter("coap_input_connections_open"),
+			ObservesActive:  mgr.Metrics().NewCounter("coap_input_observes_active"),
+			ErrorsTotal:     mgr.Metrics().NewCounter("coap_input_errors_total"),
 		},
 	}
 
@@ -240,36 +239,21 @@ func parseSecurityConfig(conf *service.ParsedConfig) (connection.SecurityConfig,
 	}
 
 	if securityMode == "psk" {
-		if conf.ContainsPath("security", "psk_identity") {
-			security.PSKIdentity, err = conf.FieldString("security", "psk_identity")
-			if err != nil {
-				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.psk_identity: %w", err)
-			}
+		if pskIdentity, err := conf.FieldString("security", "psk_identity"); err == nil {
+			security.PSKIdentity = pskIdentity
 		}
-		if conf.ContainsPath("security", "psk_key") {
-			security.PSKKey, err = conf.FieldString("security", "psk_key")
-			if err != nil {
-				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.psk_key: %w", err)
-			}
+		if pskKey, err := conf.FieldString("security", "psk_key"); err == nil {
+			security.PSKKey = pskKey
 		}
 	} else if securityMode == "certificate" {
-		if conf.ContainsPath("security", "cert_file") {
-			security.CertFile, err = conf.FieldString("security", "cert_file")
-			if err != nil {
-				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.cert_file: %w", err)
-			}
+		if certFile, err := conf.FieldString("security", "cert_file"); err == nil {
+			security.CertFile = certFile
 		}
-		if conf.ContainsPath("security", "key_file") {
-			security.KeyFile, err = conf.FieldString("security", "key_file")
-			if err != nil {
-				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.key_file: %w", err)
-			}
+		if keyFile, err := conf.FieldString("security", "key_file"); err == nil {
+			security.KeyFile = keyFile
 		}
-		if conf.ContainsPath("security", "ca_cert_file") {
-			security.CACertFile, err = conf.FieldString("security", "ca_cert_file")
-			if err != nil {
-				return connection.SecurityConfig{}, fmt.Errorf("failed to parse security.ca_cert_file: %w", err)
-			}
+		if caCertFile, err := conf.FieldString("security", "ca_cert_file"); err == nil {
+			security.CACertFile = caCertFile
 		}
 		security.InsecureSkip, err = conf.FieldBool("security", "insecure_skip_verify")
 		if err != nil {
@@ -495,9 +479,9 @@ func (i *Input) Read(ctx context.Context) (*service.Message, service.AckFunc, er
 				// Attempt to get message metadata for logging
 				var msgDetails string
 				if mStr, mErr := msg.AsBytes(); mErr == nil {
-					msgDetails = fmt.Sprintf("Message ID: %s, Content snippet: %s", msg.ID(), string(mStr[:min(20, len(mStr))]))
+					msgDetails = fmt.Sprintf("Content snippet: %s", string(mStr[:min(20, len(mStr))]))
 				} else {
-					msgDetails = fmt.Sprintf("Message ID: %s (content not available)", msg.ID())
+					msgDetails = "content not available"
 				}
 				i.logger.Error(fmt.Sprintf("Message processing failed for CoAP input. Endpoints: %v. Details: %s. Error: %v", i.connManager.Config().Endpoints, msgDetails, err))
 				i.metrics.ErrorsTotal.Incr(1)

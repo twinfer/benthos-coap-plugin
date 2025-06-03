@@ -135,7 +135,7 @@ func TestValidateFileExists(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to create temp file in home directory: %v", err)
 		}
-		file.Close() // Close immediately, we just need it to exist.
+		file.Close()                  // Close immediately, we just need it to exist.
 		defer os.Remove(tempFilePath) // Ensure cleanup
 
 		err = validateFileExists(filepath.Join("~", tempFileName))
