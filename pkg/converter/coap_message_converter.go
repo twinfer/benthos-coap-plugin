@@ -81,7 +81,7 @@ func (c *Converter) MessageToCoAP(msg *service.Message) (*message.Message, error
 
 	// Create CoAP message
 	coapMsg := &message.Message{}
-	
+
 	// Set message type to Confirmable by default
 	coapMsg.Type = message.Confirmable
 
@@ -346,7 +346,7 @@ func (c *Converter) mimeTypeToContentFormat(mimeType string) uint32 {
 func (c *Converter) addOptionsFromMetadata(coapMsg *message.Message, msg *service.Message) {
 	// Note: go-coap v3 requires buffer-based option setting which is complex
 	// For now, we'll implement a simplified version using the higher-level methods
-	
+
 	// URI Path - use SetPath if available
 	if uriPath, exists := msg.MetaGet("coap_uri_path"); exists {
 		path := strings.Trim(uriPath, "/")

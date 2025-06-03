@@ -14,15 +14,15 @@ import (
 // Test server helpers - creates a simple UDP echo server for testing
 func startTestUDPServer(t *testing.T, port int) (net.Addr, func()) {
 	t.Helper()
-	
+
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("localhost:%d", port))
 	require.NoError(t, err)
-	
+
 	conn, err := net.ListenUDP("udp", addr)
 	require.NoError(t, err)
-	
+
 	done := make(chan bool)
-	
+
 	go func() {
 		buf := make([]byte, 1024)
 		for {
@@ -40,10 +40,10 @@ func startTestUDPServer(t *testing.T, port int) (net.Addr, func()) {
 			}
 		}
 	}()
-	
+
 	// Wait for server to start
 	time.Sleep(50 * time.Millisecond)
-	
+
 	return conn.LocalAddr(), func() {
 		close(done)
 		conn.Close()
@@ -92,7 +92,7 @@ func TestCreateFactory(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			factory, err := CreateFactory(tt.protocol)
-			
+
 			if tt.wantErr {
 				assert.Error(t, err)
 				assert.Nil(t, factory)
@@ -316,15 +316,15 @@ func TestSecurityConfig(t *testing.T) {
 
 	t.Run("TLS Certificate Config with CA", func(t *testing.T) {
 		factory := &TCPTLSFactory{}
-		
+
 		// Create temporary test files
 		certFile := "/tmp/test.crt"
 		keyFile := "/tmp/test.key"
 		caFile := "/tmp/ca.crt"
-		
+
 		// Note: Testing with non-existent files to verify error handling
 		// In real tests, you would create temporary test certificates
-		
+
 		security := SecurityConfig{
 			Mode:         "certificate",
 			CertFile:     certFile,
@@ -343,7 +343,7 @@ func TestSecurityConfig(t *testing.T) {
 // Benchmark tests
 func BenchmarkCreateFactory(b *testing.B) {
 	protocols := []string{"udp", "tcp", "udp-dtls", "tcp-tls"}
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		protocol := protocols[i%len(protocols)]
@@ -359,11 +359,11 @@ func BenchmarkUDPConnection(b *testing.B) {
 	// Create a simple test helper for benchmarks
 	addr, err := net.ResolveUDPAddr("udp", "localhost:5691")
 	require.NoError(b, err)
-	
+
 	serverConn, err := net.ListenUDP("udp", addr)
 	require.NoError(b, err)
 	defer serverConn.Close()
-	
+
 	// Start echo server
 	done := make(chan bool)
 	go func() {
@@ -383,22 +383,22 @@ func BenchmarkUDPConnection(b *testing.B) {
 		}
 	}()
 	defer close(done)
-	
+
 	time.Sleep(50 * time.Millisecond)
-	
+
 	factory := &UDPFactory{}
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		conn, err := factory.Create(serverConn.LocalAddr().String(), SecurityConfig{})
 		if err != nil {
 			b.Fatal(err)
 		}
-		
+
 		if err := factory.Validate(conn); err != nil {
 			b.Fatal(err)
 		}
-		
+
 		if err := factory.Close(conn); err != nil {
 			b.Fatal(err)
 		}
@@ -421,19 +421,19 @@ func (m *mockConn) Close() error {
 func TestConnectionValidationWithContext(t *testing.T) {
 	t.Run("TCP factory rejects invalid connection type", func(t *testing.T) {
 		factory := &TCPFactory{}
-		
+
 		// Create a mock connection of wrong type
 		mockConnection := &mockConn{ctx: context.Background()}
-		
+
 		// This should fail because mockConn is not *coapTCPClient.Conn
 		err := factory.Validate(mockConnection)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "invalid connection type for TCP factory")
 	})
-	
+
 	t.Run("DTLS factory rejects invalid connection type", func(t *testing.T) {
 		factory := &DTLSFactory{}
-		
+
 		// This should fail because string is not *client.Conn
 		err := factory.Validate("not a connection")
 		assert.Error(t, err)

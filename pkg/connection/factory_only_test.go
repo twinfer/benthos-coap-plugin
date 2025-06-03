@@ -44,7 +44,7 @@ func TestCreateFactory(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			factory, err := connection.CreateFactory(tt.protocol)
-			
+
 			if tt.wantErr {
 				assert.Error(t, err)
 				assert.Nil(t, factory)

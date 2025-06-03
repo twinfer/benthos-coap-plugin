@@ -52,7 +52,7 @@ func TestDTLSConfigCreation(t *testing.T) {
 			PSKIdentity: "client1",
 			PSKKey:      "secretkey",
 		}
-		
+
 		dtlsConfig, err := factory.createDTLSConfig(config)
 		require.NoError(t, err)
 		require.NotNil(t, dtlsConfig)
@@ -66,7 +66,7 @@ func TestDTLSConfigCreation(t *testing.T) {
 			Mode:   "psk",
 			PSKKey: "secretkey",
 		}
-		
+
 		_, err := factory.createDTLSConfig(config)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "PSK mode requires both psk_key and psk_identity")
@@ -77,7 +77,7 @@ func TestDTLSConfigCreation(t *testing.T) {
 			Mode:        "psk",
 			PSKIdentity: "client1",
 		}
-		
+
 		_, err := factory.createDTLSConfig(config)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "PSK mode requires both psk_key and psk_identity")
@@ -87,7 +87,7 @@ func TestDTLSConfigCreation(t *testing.T) {
 		config := SecurityConfig{
 			Mode: "oauth2",
 		}
-		
+
 		_, err := factory.createDTLSConfig(config)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "unsupported security mode for DTLS")
@@ -101,7 +101,7 @@ func TestTCPTLSConfigCreation(t *testing.T) {
 		config := SecurityConfig{
 			Mode: "none",
 		}
-		
+
 		tlsConfig, err := factory.createTLSConfig(config)
 		require.NoError(t, err)
 		require.NotNil(t, tlsConfig)
@@ -114,7 +114,7 @@ func TestTCPTLSConfigCreation(t *testing.T) {
 			CertFile: "/nonexistent/cert.pem",
 			KeyFile:  "/nonexistent/key.pem",
 		}
-		
+
 		_, err := factory.createTLSConfig(config)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to load certificate pair")
@@ -125,7 +125,7 @@ func TestTCPTLSConfigCreation(t *testing.T) {
 			Mode:     "certificate",
 			CertFile: "cert.pem",
 		}
-		
+
 		_, err := factory.createTLSConfig(config)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "certificate mode requires both cert_file and key_file")
@@ -136,7 +136,7 @@ func TestTCPTLSConfigCreation(t *testing.T) {
 			Mode:         "none",
 			InsecureSkip: true,
 		}
-		
+
 		tlsConfig, err := factory.createTLSConfig(config)
 		require.NoError(t, err)
 		assert.True(t, tlsConfig.InsecureSkipVerify)

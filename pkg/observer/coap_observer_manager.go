@@ -210,7 +210,7 @@ func (m *Manager) observeWithRetry(ctx context.Context, sub *Subscription) {
 func (m *Manager) performObserve(ctx context.Context, sub *Subscription) error {
 	// Simplified implementation for go-coap v3 compatibility
 	// TODO: Implement proper observe functionality using go-coap v3 APIs
-	
+
 	observeCtx, cancel := context.WithTimeout(ctx, m.config.ObserveTimeout)
 	defer cancel()
 
@@ -255,7 +255,7 @@ func (m *Manager) handleObserveMessage(path string, coapMsg *mux.Message) {
 			bodyBytes, _ = io.ReadAll(seeker)
 		}
 	}
-	
+
 	// Create Benthos message with the payload
 	msg := service.NewMessage(bodyBytes)
 	if msg == nil {
