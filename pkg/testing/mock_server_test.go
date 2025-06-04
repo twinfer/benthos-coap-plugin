@@ -2,9 +2,12 @@
 package testing
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -181,7 +184,6 @@ func TestMockCoAPServer_PostResource(t *testing.T) {
 	}
 	assert.True(t, isJson, "ContentFormat for POST in history should be AppJSON")
 
-
 	assert.Equal(t, codes.GET, history[1].Code, "Second request in history should be GET")
 	assert.Equal(t, path, history[1].Path, "Path for GET in history is incorrect")
 }
@@ -217,7 +219,6 @@ func TestMockCoAPServer_PutResource(t *testing.T) {
 	assert.Equal(t, putData, retrievedData, "Server-side data should match PUT data")
 	res, _ := server.resources[path]
 	assert.Equal(t, putContentType, res.ContentType, "Server-side content type should match PUT content type")
-
 
 	// 2. PUT to create resource (if not exists)
 	newPath := "/put-create-test"
@@ -307,18 +308,19 @@ func TestMockCoAPServer_ClearRequestHistory(t *testing.T) {
 type mockObserveResponseWriter struct {
 	mux.ResponseWriter // Embed the interface
 	// Add fields to store responses if needed for assertions
-	LastCode    codes.Code
-	LastPayload []byte
-	LastOptions message.Options
-	ConnInfo    mux.ConnInfo
-	mu          sync.Mutex
+	LastCode     codes.Code
+	LastPayload  []byte
+	LastOptions  message.Options
+	ConnInfo     mux.ConnInfo  // Connection info from the original request
+	requestToken message.Token // Token from the original request
+	mu           sync.Mutex    // Mutex to protect LastCode, LastPayload, LastOptions
 	// Channel to signal that a response has been set.
 	// The channel will receive the CoAP code of the response.
 	responseSignal chan codes.Code
 }
 
-// newMockObserveResponseWriter creates a new mock writer with an initialized channel.
-func newMockObserveResponseWriter(connInfo mux.ConnInfo) *mockObserveResponseWriter {
+// newMockObserveResponseWriter creates a new mock writer with an initialized channel and stores connection info and request token.
+func newMockObserveResponseWriter(connInfo mux.ConnInfo, token message.Token) *mockObserveResponseWriter {
 	return &mockObserveResponseWriter{
 		ConnInfo:       connInfo,
 		responseSignal: make(chan codes.Code, 5), // Buffered channel for multiple notifications
@@ -337,16 +339,16 @@ func (m *mockObserveResponseWriter) SetResponse(code codes.Code, contentFormat m
 	}
 
 	var currentOpts message.Options
-	if contentFormat != message. заповедникContentFormat { // Use a sentinel value for "not set"
-		// Correctly assign the result of SetContentFormat back to currentOpts
+	var err error           // Declare err here
+	if contentFormat != 0 { // Check if a specific content format was provided (0 indicates no content format)
 		// Max size for content format option encoding is 2 bytes for uint16.
 		buf := make([]byte, 2)
-		encodedVal, err := contentFormat.Marshal()
+		// Use SetContentFormat directly, it handles encoding the MediaType
+		currentOpts, _, err = currentOpts.SetContentFormat(buf, contentFormat) // Assign to the declared err, discard bytes written
 		if err != nil {
 			m.signalResponse(codes.InternalServerError) // Signal even on error if possible
-			return fmt.Errorf("failed to marshal content format: %w", err)
+			return fmt.Errorf("failed to set content format option: %w", err)
 		}
-		currentOpts, _, _ = currentOpts.SetContentFormat(buf, encodedVal...)
 	}
 
 	for _, opt := range opts {
@@ -358,7 +360,7 @@ func (m *mockObserveResponseWriter) SetResponse(code codes.Code, contentFormat m
 }
 
 func (m *mockObserveResponseWriter) Conn() mux.Conn {
-	return &mockClientConn{info: m.ConnInfo, parentRW: m}
+	return &mockClientConn{info: m.ConnInfo, requestToken: m.requestToken} // Pass ConnInfo and requestToken
 }
 
 func (m *mockObserveResponseWriter) SetOptionBytes(optID message.OptionID, value []byte) error {
@@ -396,22 +398,47 @@ func (m *mockObserveResponseWriter) waitForResponse(timeout time.Duration) (code
 
 // mockClientConn to satisfy mux.Conn for ResponseWriter in observe tests
 type mockClientConn struct {
-	mux.ClientConn
-	info     mux.ConnInfo
-	parentRW *mockObserveResponseWriter // To access LastOptions for CreateMessage
+	info         mux.ConnInfo  // Connection info
+	requestToken message.Token // Token from the original request
 }
 
-func (m *mockClientConn) Close() error                        { return nil }
-func (m *mockClientConn) LocalAddr() net.Addr                 { return &net.UDPAddr{IP: net.IPv4(127,0,0,1), Port: 65432} }
-func (m *mockClientConn) RemoteAddr() net.Addr                { return m.info.RemoteAddr }
-func (m *mockClientConn) SetReadDeadline(t time.Time) error   { return nil }
-func (m *mockClientConn) SetWriteDeadline(t time.Time) error  { return nil }
+func (m *mockClientConn) Close() error { return nil }
+func (m *mockClientConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 65432}
+}
+func (m *mockClientConn) RemoteAddr() net.Addr                        { return m.info.RemoteAddr }
+func (m *mockClientConn) SetReadDeadline(t time.Time) error           { return nil }
+func (m *mockClientConn) SetWriteDeadline(t time.Time) error          { return nil }
 func (m *mockClientConn) Do(req *pool.Message) (*pool.Message, error) { return nil, nil }
-func (m *mockClientConn) Context() context.Context            { return context.Background() }
-func (m *mockClientConn) SetContext(ctx context.Context)      {}
-func (m *mockClientConn) ConnInfo() mux.ConnInfo              { return m.info }
-func (m *mockClientConn) WriteMessage(req *pool.Message) error { return nil }
-func (m *mockClientConn) ReadMessage() (*pool.Message, error) { return nil, fmt.Errorf("not implemented") }
+func (m *mockClientConn) Context() context.Context                    { return context.Background() }
+func (m *mockClientConn) SetContext(ctx context.Context)              {}
+func (m *mockClientConn) ConnInfo() mux.ConnInfo                      { return m.info }
+func (m *mockClientConn) WriteMessage(req *pool.Message) error        { return nil }
+
+// AcquireMessage implements the mux.Conn interface.
+func (m *mockClientConn) AcquireMessage(ctx context.Context) *pool.Message {
+	return pool.NewMessage(ctx) // Return a new message from the pool
+}
+
+// AddOnClose implements the mux.Conn interface.
+func (m *mockClientConn) AddOnClose(f func()) {
+	// For a mock, this can be a no-op or log if needed.
+}
+
+// Delete implements a CoAP DELETE operation.
+// Note: This method is not standard on mux.Conn in go-coap/v3 v3.3.6.
+// It's added here to satisfy a compiler requirement, which might indicate
+// a different version or local modification of the mux.Conn interface.
+func (m *mockClientConn) Delete(ctx context.Context, path string, opts ...message.Option) (*pool.Message, error) {
+	// Return a simple success response for a DELETE operation.
+	resp := pool.NewMessage(m.Context())
+	resp.SetCode(codes.Deleted) // Standard success code for DELETE
+	// No payload or specific options needed for a basic mock DELETE response.
+	return resp, nil
+}
+func (m *mockClientConn) ReadMessage() (*pool.Message, error) {
+	return nil, fmt.Errorf("not implemented")
+}
 func (m *mockClientConn) Ping(ctx context.Context) error { return nil }
 
 // CreateMessage is called by the server to create response messages.
@@ -419,23 +446,14 @@ func (m *mockClientConn) Ping(ctx context.Context) error { return nil }
 // However, mux.ResponseWriter doesn't easily expose the original request's token for ACK/RST matching.
 // The go-coap server handles this internally. For this mock, we might not need to replicate it perfectly,
 // but if we were testing token handling in responses, this would be a place for it.
-func (m *mockClientConn) CreateMessage(opts message.Options, code codes.Code,  payload io.ReadSeeker) *pool.Message {
+func (m *mockClientConn) CreateMessage(opts message.Options, code codes.Code, payload io.ReadSeeker) *pool.Message {
 	msg := pool.NewMessage(m.Context())
 	msg.SetCode(code)
 	msg.SetBody(payload)
-	// For a response, the token should typically match the request's token.
-	// The mux.ResponseWriter provided by the actual server would handle this.
-	// Our mock RW doesn't store the request token directly, but the server's addObserver does.
-	// This CreateMessage is more for generic responses from the Conn; observe notifications
-	// are built upon the initial ResponseWriter.
-	if m.parentRW != nil { // Try to get token from options if set by a handler
-		m.parentRW.mu.Lock()
-		if token, err := m.parentRW.LastOptions.Token(); err == nil && len(token) > 0 {
-			msg.SetToken(token)
-		} else {
-			msg.SetToken(message.GenerateToken()) // Fallback
-		}
-		m.parentRW.mu.Unlock()
+
+	// Set the token from the original request if available, otherwise generate a new one.
+	if len(m.requestToken) > 0 { // Check if the request token is non-empty
+		msg.SetToken(m.requestToken)
 	} else {
 		msg.SetToken(message.GenerateToken())
 	}
@@ -446,7 +464,6 @@ func (m *mockClientConn) SendMessage(msg *pool.Message) error { return nil }
 func (m *mockClientConn) GetMessage(ctx context.Context, token message.Token, path string) (*pool.Message, error) {
 	return nil, fmt.Errorf("not implemented")
 }
-
 
 const (
 	testObservePath    = "/observe-test"
@@ -462,7 +479,7 @@ func TestMockCoAPServer_Observe(t *testing.T) {
 	server.AddResource(testObservePath, message.TextPlain, []byte(initialObserveData), true)
 	observeToken := message.Token("obs1")
 
-	mockRW := newMockObserveResponseWriter(mux.ConnInfo{
+	mockRW := newMockObserveResponseWriter(mux.ConnInfo{ // Pass ConnInfo and token
 		RemoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345},
 	})
 
@@ -483,7 +500,6 @@ func TestMockCoAPServer_Observe(t *testing.T) {
 	// Simulate handling the initial observe request
 	// mux.NewMessage(reqMsg) is important to wrap pool.Message for handler
 	handler.HandleRequest(mockRW, mux.NewMessage(reqMsg), testObservePath)
-
 
 	// 1. Verify initial response to GET (which is synchronous)
 	code, received := mockRW.waitForResponse(200 * time.Millisecond) // Wait for the SetResponse signal
@@ -533,18 +549,17 @@ func TestMockCoAPServer_Observe(t *testing.T) {
 	assert.Equal(t, uint32(1), notificationObserveSeq, "Notification Observe sequence should be 1 (was %d)", notificationObserveSeq)
 }
 
-
 // failingResponseWriter is a mock ResponseWriter that can be configured to fail SetOptionBytes.
 type failingResponseWriter struct {
-	mockObserveResponseWriter // Embed the working mock observe writer
-	failSetObserveOption bool   // If true, SetOptionBytes will fail for Observe option
+	mockObserveResponseWriter         // Embed the working mock observe writer
+	failSetObserveOption         bool // If true, SetOptionBytes will fail for Observe option
 	observeOptionSetSuccessfully bool // Tracks if the Observe option was set
 }
 
 func newFailingResponseWriter(connInfo mux.ConnInfo, failObserve bool) *failingResponseWriter {
 	return &failingResponseWriter{
-		mockObserveResponseWriter: *newMockObserveResponseWriter(connInfo), // Initialize embedded part
-		failSetObserveOption:   failObserve,
+		mockObserveResponseWriter:    *newMockObserveResponseWriter(connInfo), // Initialize embedded part
+		failSetObserveOption:         failObserve,
 		observeOptionSetSuccessfully: false,
 	}
 }
@@ -569,7 +584,6 @@ func (m *failingResponseWriter) SetResponse(code codes.Code, contentFormat messa
 	return err
 }
 
-
 func TestMockCoAPServer_Observe_NotificationErrorDeactivatesObserver(t *testing.T) {
 	server, serverCleanup := setupTestServer(t)
 	defer serverCleanup()
@@ -579,7 +593,7 @@ func TestMockCoAPServer_Observe_NotificationErrorDeactivatesObserver(t *testing.
 
 	// Use the failingResponseWriter, configured to fail setting the Observe option during notification
 	mockRWFail := newFailingResponseWriter(mux.ConnInfo{
-		RemoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12346},
+		RemoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12346}, // Pass ConnInfo and token
 	}, true) // true means fail SetOptionBytes for Observe
 
 	reqMsg := pool.NewMessage(context.Background())
@@ -612,7 +626,6 @@ func TestMockCoAPServer_Observe_NotificationErrorDeactivatesObserver(t *testing.
 	}
 	mockRWFail.mu.Unlock()
 	assert.True(t, initialObserveSet, "Observe option should have been set on the initial response")
-
 
 	// 2. Update the resource, which should trigger a notification
 	// The sendObserveNotification will use mockRWFail, which will cause SetOptionBytes(Observe,...) to fail.
@@ -706,7 +719,6 @@ func TestMockCoAPServer_GetWithIfMatch(t *testing.T) {
 	// assert.Equal(t, codes.PreconditionFailed, respWrong.Code(), "GET with wrong If-Match should return PreconditionFailed")
 	assert.Equal(t, codes.Content, respWrong.Code(), "GET with wrong If-Match currently returns Content (handler not ETag aware)")
 
-
 	// 3. GET with If-Match, but resource has no ETag (server should ignore If-Match)
 	pathNoETag := "/no-etag-resource"
 	server.AddResource(pathNoETag, message.TextPlain, data, false) // No ETag option
@@ -750,7 +762,6 @@ func TestMockCoAPServer_ServeWithOptions(t *testing.T) {
 	data := []byte("Serve these options!")
 	serveETag := []byte{0xAA, 0xBB, 0xCC}
 	maxAgeVal := uint32(60)
-
 
 	server.AddResource(path, message.TextPlain, data, false,
 		message.Option{ID: message.ETag, Value: serveETag},
@@ -801,7 +812,6 @@ func TestMockCoAPServer_CaptureLastPutOrPostOptions(t *testing.T) {
 	req.SetOptionBytes(customOptionID, customOptionValue)
 	req.SetContentFormat(message.AppOctets)
 
-
 	_, err := client.client.Do(req)
 	require.NoError(t, err, "POST request with custom option should not error")
 
@@ -841,7 +851,7 @@ func TestMockCoAPServer_PostWithUnexpectedContentFormat(t *testing.T) {
 
 	path := "/unexpected-cf"
 	jsonData := []byte(`{"key":"value"}`) // JSON data
-	xmlContentType := message.AppXML       // But client sends it as XML
+	xmlContentType := message.AppXML      // But client sends it as XML
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

@@ -24,7 +24,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"sync"
 	"time"
 
@@ -62,17 +61,17 @@ type RequestHandler interface {
 // - Thread-Safe: Operations are protected by mutexes for safe concurrent access.
 type MockCoAPServer struct {
 	addr                 string
-	listener             *coapNet.UDPConn // Underlying CoAP UDP connection.
-	server               *server.Server                  // The core CoAP server instance.
-	resources            map[string]*MockResource        // Map of URI paths to their corresponding MockResource.
+	listener             *coapNet.UDPConn              // Underlying CoAP UDP connection.
+	server               *server.Server                // The core CoAP server instance.
+	resources            map[string]*MockResource      // Map of URI paths to their corresponding MockResource.
 	requestHandlers      map[codes.Code]RequestHandler // Map of CoAP codes to their respective handlers.
-	observers            map[string][]Observer           // Map of URI paths to lists of active observers.
+	observers            map[string][]Observer         // Map of URI paths to lists of active observers.
 	lastReceivedOptions  map[string][]message.Option   // Stores the options of the last request for a given path (legacy, consider phasing out).
 	lastReceivedMessages map[string]*message.Message   // Stores the last message for a given path (legacy, consider phasing out).
-	mu                   sync.RWMutex                    // Mutex for thread-safe access to shared server state.
-	running              bool                            // Indicates if the server is currently running.
-	cancel               context.CancelFunc              // Function to cancel the server's context, used for stopping.
-	requestHistory       []LoggedRequest                 // Log of received requests for test inspection.
+	mu                   sync.RWMutex                  // Mutex for thread-safe access to shared server state.
+	running              bool                          // Indicates if the server is currently running.
+	cancel               context.CancelFunc            // Function to cancel the server's context, used for stopping.
+	requestHistory       []LoggedRequest               // Log of received requests for test inspection.
 	// TODO: Add responseHistory for enhanced observability, potentially storing LoggedResponse structs.
 }
 
@@ -81,13 +80,13 @@ type MockCoAPServer struct {
 // All mutable fields (Token, Options, Payload) are deep copies of the original request data
 // to ensure they are not modified by subsequent processing.
 type LoggedRequest struct {
-	Timestamp time.Time         // Timestamp indicating when the server logged the request (UTC).
-	Path      string            // URI path extracted from the request.
-	Code      codes.Code        // CoAP method code (e.g., codes.GET, codes.POST).
-	Token     message.Token     // CoAP token (a deep copy).
-	Type      message.MessageType // CoAP message type (Confirmable, NonConfirmable, etc.).
-	Options   message.Options   // CoAP options included in the request (a deep copy).
-	Payload   []byte            // Payload/body of the request (a deep copy).
+	Timestamp time.Time       // Timestamp indicating when the server logged the request (UTC).
+	Path      string          // URI path extracted from the request.
+	Code      codes.Code      // CoAP method code (e.g., codes.GET, codes.POST).
+	Token     message.Token   // CoAP token (a deep copy).
+	Type      message.Type    // CoAP message type (Confirmable, NonConfirmable, etc.).
+	Options   message.Options // CoAP options included in the request (a deep copy).
+	Payload   []byte          // Payload/body of the request (a deep copy).
 }
 
 // responseWriterWithOptions is an internal interface used to abstract the setting of CoAP options
@@ -103,7 +102,7 @@ type responseWriterWithOptions interface {
 // It holds the resource's properties, data, and observation-related state.
 type MockResource struct {
 	Path                 string            // URI path of the resource.
-	ContentType          message.MediaType   // CoAP content type of the resource's payload.
+	ContentType          message.MediaType // CoAP content type of the resource's payload.
 	Data                 []byte            // Current data/payload of the resource.
 	Observable           bool              // Flag indicating if the resource supports CoAP observation.
 	ObserveSeq           uint32            // Current observe sequence number for notifications.
@@ -138,16 +137,19 @@ func NewMockCoAPServer() *MockCoAPServer {
 	s.requestHandlers[codes.PUT] = &PutHandler{server: s}
 	s.requestHandlers[codes.DELETE] = &DeleteHandler{server: s}
 	return s
+}
+
 // AddResource adds a new resource to the mock server or updates an existing one at the given path.
 //
 // Parameters:
-//   path: The URI path for the resource (e.g., "/temp", "/config/led").
-//   contentType: The CoAP message.MediaType to be used for the resource's payload.
-//   data: The initial byte slice data for the resource.
-//   observable: A boolean indicating whether this resource should support CoAP observations.
-//               If true, clients can register to observe changes.
-//   opts: A variadic slice of message.Option to be served with this resource on GET requests.
-//         These options are added to every GET response for this resource.
+//
+//	path: The URI path for the resource (e.g., "/temp", "/config/led").
+//	contentType: The CoAP message.MediaType to be used for the resource's payload.
+//	data: The initial byte slice data for the resource.
+//	observable: A boolean indicating whether this resource should support CoAP observations.
+//	            If true, clients can register to observe changes.
+//	opts: A variadic slice of message.Option to be served with this resource on GET requests.
+//	      These options are added to every GET response for this resource.
 func (m *MockCoAPServer) AddResource(path string, contentType message.MediaType, data []byte, observable bool, opts ...message.Option) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -157,7 +159,7 @@ func (m *MockCoAPServer) AddResource(path string, contentType message.MediaType,
 		ContentType:      contentType,
 		Data:             data,
 		Observable:       observable,
-		ObserveSeq:       0, // Initial sequence number for observations.
+		ObserveSeq:       0,                // Initial sequence number for observations.
 		LastModified:     time.Now().UTC(), // Use UTC for consistency.
 		ServeWithOptions: opts,
 	}
@@ -168,13 +170,15 @@ func (m *MockCoAPServer) AddResource(path string, contentType message.MediaType,
 // The resource's LastModified timestamp and ObserveSeq (if observable) are updated.
 //
 // Parameters:
-//   path: The URI path of the resource to update.
-//   data: The new byte slice data for the resource.
-//   newOpts: Optional CoAP options that will replace the resource's ServeWithOptions if provided.
-//            If not provided, existing ServeWithOptions are retained.
+//
+//	path: The URI path of the resource to update.
+//	data: The new byte slice data for the resource.
+//	newOpts: Optional CoAP options that will replace the resource's ServeWithOptions if provided.
+//	         If not provided, existing ServeWithOptions are retained.
 //
 // Returns:
-//   An error if the resource at the given path is not found. Otherwise, nil.
+//
+//	An error if the resource at the given path is not found. Otherwise, nil.
 func (m *MockCoAPServer) UpdateResource(path string, data []byte, newOpts ...message.Option) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -189,7 +193,7 @@ func (m *MockCoAPServer) UpdateResource(path string, data []byte, newOpts ...mes
 		resource.ObserveSeq++
 	}
 	resource.LastModified = time.Now().UTC() // Use UTC for consistency.
-	if len(newOpts) > 0 { // Allow updating options served by the resource too
+	if len(newOpts) > 0 {                    // Allow updating options served by the resource too
 		resource.ServeWithOptions = newOpts
 	}
 
@@ -258,7 +262,7 @@ func (m *MockCoAPServer) Stop() error {
 	}
 	m.running = false
 	if m.cancel != nil {
-		m.cancel() // Signal the server's goroutine to exit.
+		m.cancel()     // Signal the server's goroutine to exit.
 		m.cancel = nil // Avoid multiple cancellations.
 	}
 	// Note: The underlying go-coap server's Serve method handles listener closing on context cancellation.
@@ -295,7 +299,7 @@ func (m *MockCoAPServer) handleRequest(w mux.ResponseWriter, r *mux.Message) {
 	} else {
 		// Respond with MethodNotAllowed if no handler is registered for the CoAP code
 		// It's good practice to provide a payload explaining the error.
-		if errResp := w.SetResponse(codes.MethodNotAllowed, message.TextPlain, []byte("Method not allowed")); errResp != nil {
+		if errResp := w.SetResponse(codes.MethodNotAllowed, message.TextPlain, bytes.NewReader([]byte("Method not allowed"))); errResp != nil {
 			fmt.Printf("MockCoAPServer ERROR: [HandleRequest %s] Failed to set MethodNotAllowed response for code %s: %v\n", path, r.Code(), errResp)
 		}
 	}
@@ -315,7 +319,7 @@ func (h *GetHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path st
 	h.server.mu.RUnlock()
 
 	if !exists {
-		if err := w.SetResponse(codes.NotFound, message.TextPlain, []byte("Resource not found")); err != nil {
+		if err := w.SetResponse(codes.NotFound, message.TextPlain, bytes.NewReader([]byte("Resource not found"))); err != nil {
 			fmt.Printf("MockCoAPServer ERROR: [GET %s] Failed to set NotFound response: %v\n", path, err)
 		}
 		return
@@ -342,8 +346,8 @@ func (h *GetHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path st
 			}
 
 			buf := make([]byte, 4) // Max size for uint32 CoAP encoding
-			resultBuffer, bytesWritten := message.EncodeUint32(buf, resource.ObserveSeq)
-			obsBytes := resultBuffer[:bytesWritten]
+			bytesWritten, _ := message.EncodeUint32(buf, resource.ObserveSeq)
+			obsBytes := buf[:bytesWritten]
 			if errSetOpt := rw.SetOptionBytes(message.Observe, obsBytes); errSetOpt != nil {
 				fmt.Printf("MockCoAPServer WARNING: [GET %s] Failed to set Observe option (bytes, seq %d) on initial response: %v\n", path, resource.ObserveSeq, errSetOpt)
 			} else {
@@ -351,7 +355,7 @@ func (h *GetHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path st
 			}
 		} else {
 			// Resource is not observable
-			if err := w.SetResponse(codes.NotAcceptable, message.TextPlain, []byte("Resource not observable")); err != nil {
+			if err := w.SetResponse(codes.NotAcceptable, message.TextPlain, bytes.NewReader([]byte("Resource not observable"))); err != nil {
 				fmt.Printf("MockCoAPServer ERROR: [GET %s] Failed to set NotAcceptable response for non-observable resource: %v\n", path, err)
 			}
 		}
@@ -367,17 +371,17 @@ func (m *MockCoAPServer) setResponseWithOptions(w mux.ResponseWriter, code codes
 	rw, ok := w.(responseWriterWithOptions)
 	if !ok {
 		fmt.Printf("MockCoAPServer WARNING: [Response %s] ResponseWriter does not implement SetOptionBytes. Cannot set custom CoAP options.\n", requestPathForLogging)
-		if err := w.SetResponse(code, ct, payload); err != nil {
+		if err := w.SetResponse(code, ct, bytes.NewReader(payload)); err != nil {
 			fmt.Printf("MockCoAPServer ERROR: [Response %s] Failed to set basic response (code %v) after SetOptionBytes incompatibility: %v\n", requestPathForLogging, code, err)
 		}
 		return
 	}
 
-	if err := rw.SetResponse(code, ct, payload); err != nil {
+	if err := rw.SetResponse(code, ct, bytes.NewReader(payload)); err != nil {
 		fmt.Printf("MockCoAPServer ERROR: [Response %s] Failed to set response (code %v): %v\n", requestPathForLogging, code, err)
 	}
 	for _, opt := range opts {
-		if err := w.SetOptionBytes(opt.ID, opt.Value); err != nil {
+		if err := rw.SetOptionBytes(opt.ID, opt.Value); err != nil {
 			// Non-critical options might fail, so log as warning.
 			fmt.Printf("MockCoAPServer WARNING: [Response %s] Failed to set option (ID %v): %v\n", requestPathForLogging, opt.ID, err)
 		}
@@ -450,8 +454,8 @@ func (m *MockCoAPServer) logCoAPRequest(path string, req *pool.Message) {
 		Code:    req.Code(),
 		Token:   tokenCopy, // Use the same copied token
 		Type:    req.Type(),
-		Options: optsCopy,  // Use the same copied options
-		Payload: bodyData,  // Use the copied payload
+		Options: optsCopy, // Use the same copied options
+		Payload: bodyData, // Use the copied payload
 	}
 }
 
@@ -478,13 +482,13 @@ func (h *PostHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path s
 		h.server.resources[path] = resource
 	}
 	resource.LastPutOrPostOptions = optsCopy // Store received options on the resource
-	h.server.mu.Unlock() // Unlock early before I/O and potential UpdateResource call (which locks)
+	h.server.mu.Unlock()                     // Unlock early before I/O and potential UpdateResource call (which locks)
 
 	// Payload processing should occur after critical section if possible
 	data, err := io.ReadAll(r.Body()) // Read payload from mux.Message's Body
 	if err != nil {
 		fmt.Printf("MockCoAPServer ERROR: [POST %s] Failed to read request payload: %v\n", path, err)
-		if errResp := w.SetResponse(codes.InternalServerError, message.TextPlain, []byte("Failed to read payload")); errResp != nil {
+		if errResp := w.SetResponse(codes.InternalServerError, message.TextPlain, bytes.NewReader([]byte("Failed to read payload"))); errResp != nil {
 			fmt.Printf("MockCoAPServer ERROR: [POST %s] Failed to set InternalServerError response after payload read error: %v\n", path, errResp)
 		}
 		return
@@ -545,7 +549,7 @@ func (h *PutHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path st
 	data, err := io.ReadAll(r.Body()) // Read payload from mux.Message's Body
 	if err != nil {
 		fmt.Printf("MockCoAPServer ERROR: [PUT %s] Failed to read request payload: %v\n", path, err)
-		if errResp := w.SetResponse(codes.InternalServerError, message.TextPlain, []byte("Failed to read payload")); errResp != nil {
+		if errResp := w.SetResponse(codes.InternalServerError, message.TextPlain, bytes.NewReader([]byte("Failed to read payload"))); errResp != nil {
 			fmt.Printf("MockCoAPServer ERROR: [PUT %s] Failed to set InternalServerError response after payload read error: %v\n", path, errResp)
 		}
 		return
@@ -593,7 +597,7 @@ func (h *DeleteHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path
 	defer h.server.mu.Unlock()
 
 	if _, exists := h.server.resources[path]; !exists {
-		if err := w.SetResponse(codes.NotFound, message.TextPlain, []byte("Resource not found")); err != nil {
+		if err := w.SetResponse(codes.NotFound, message.TextPlain, bytes.NewReader([]byte("Resource not found"))); err != nil {
 			fmt.Printf("MockCoAPServer ERROR: [DELETE %s] Failed to set NotFound response: %v\n", path, err)
 		}
 		return
@@ -663,8 +667,8 @@ func (m *MockCoAPServer) sendObserveNotification(observer *Observer, resource *M
 
 	// Encode and set the Observe option with the current sequence number.
 	buf := make([]byte, 4) // Max size for uint32 CoAP Observe option encoding.
-	resultBuffer, bytesWritten := message.EncodeUint32(buf, resource.ObserveSeq)
-	obsBytes := resultBuffer[:bytesWritten]
+	bytesWritten, _ := message.EncodeUint32(buf, resource.ObserveSeq)
+	obsBytes := buf[:bytesWritten]
 
 	if err := rw.SetOptionBytes(message.Observe, obsBytes); err != nil {
 		// Failure to set the Observe option is critical for the client's ability to process the notification.
@@ -835,7 +839,7 @@ func (c *MockCoAPClient) Close() error {
 // Get performs a CoAP GET request to the specified path.
 // The provided context can be used for request timeouts or cancellation.
 // Returns the server's response message or an error if the request fails.
-func (c *MockCoAPClient) Get(ctx context.Context, path string) (*message.Message, error) {
+func (c *MockCoAPClient) Get(ctx context.Context, path string) (*pool.Message, error) {
 	if c.client == nil {
 		return nil, fmt.Errorf("MockCoAPClient ERROR: [GET %s] Client not connected; call Connect() first", path)
 	}
@@ -844,13 +848,13 @@ func (c *MockCoAPClient) Get(ctx context.Context, path string) (*message.Message
 	if err != nil {
 		return nil, fmt.Errorf("MockCoAPClient ERROR: [GET %s] Request failed: %w", path, err)
 	}
-	return resp.Message, nil // Return the underlying *message.Message
+	return resp, nil // resp is already the *pool.Message
 }
 
 // Post performs a CoAP POST request to the specified path with the given content type and payload.
 // The provided context can be used for request timeouts or cancellation.
 // Returns the server's response message or an error if the request fails.
-func (c *MockCoAPClient) Post(ctx context.Context, path string, contentType message.MediaType, payload []byte) (*message.Message, error) {
+func (c *MockCoAPClient) Post(ctx context.Context, path string, contentType message.MediaType, payload []byte) (*pool.Message, error) {
 	if c.client == nil {
 		return nil, fmt.Errorf("MockCoAPClient ERROR: [POST %s] Client not connected; call Connect() first", path)
 	}
@@ -860,13 +864,13 @@ func (c *MockCoAPClient) Post(ctx context.Context, path string, contentType mess
 	if err != nil {
 		return nil, fmt.Errorf("MockCoAPClient ERROR: [POST %s] Request failed: %w", path, err)
 	}
-	return resp.Message, nil
+	return resp, nil
 }
 
 // Put performs a CoAP PUT request to the specified path with the given content type and payload.
 // The provided context can be used for request timeouts or cancellation.
 // Returns the server's response message or an error if the request fails.
-func (c *MockCoAPClient) Put(ctx context.Context, path string, contentType message.MediaType, payload []byte) (*message.Message, error) {
+func (c *MockCoAPClient) Put(ctx context.Context, path string, contentType message.MediaType, payload []byte) (*pool.Message, error) {
 	if c.client == nil {
 		return nil, fmt.Errorf("MockCoAPClient ERROR: [PUT %s] Client not connected; call Connect() first", path)
 	}
@@ -876,13 +880,13 @@ func (c *MockCoAPClient) Put(ctx context.Context, path string, contentType messa
 	if err != nil {
 		return nil, fmt.Errorf("MockCoAPClient ERROR: [PUT %s] Request failed: %w", path, err)
 	}
-	return resp.Message, nil
+	return resp, nil
 }
 
 // Delete performs a CoAP DELETE request to the specified path.
 // The provided context can be used for request timeouts or cancellation.
 // Returns the server's response message or an error if the request fails.
-func (c *MockCoAPClient) Delete(ctx context.Context, path string) (*message.Message, error) {
+func (c *MockCoAPClient) Delete(ctx context.Context, path string) (*pool.Message, error) {
 	if c.client == nil {
 		return nil, fmt.Errorf("MockCoAPClient ERROR: [DELETE %s] Client not connected; call Connect() first", path)
 	}
@@ -891,5 +895,5 @@ func (c *MockCoAPClient) Delete(ctx context.Context, path string) (*message.Mess
 	if err != nil {
 		return nil, fmt.Errorf("MockCoAPClient ERROR: [DELETE %s] Request failed: %w", path, err)
 	}
-	return resp.Message, nil
+	return resp, nil
 }
