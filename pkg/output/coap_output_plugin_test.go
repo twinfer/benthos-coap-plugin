@@ -245,7 +245,7 @@ func TestRequestOptionsHandling(t *testing.T) {
 // TestMetricsConfiguration tests metrics setup
 func TestMetricsConfiguration(t *testing.T) {
 	resources := service.MockResources()
-	
+
 	metrics := &Metrics{
 		MessagesSent:    resources.Metrics().NewCounter("messages_sent"),
 		MessagesFailed:  resources.Metrics().NewCounter("messages_failed"),
@@ -273,11 +273,11 @@ func TestMetricsConfiguration(t *testing.T) {
 // TestCoAPMessageCreation tests creating CoAP messages with proper structure
 func TestCoAPMessageCreation(t *testing.T) {
 	tests := []struct {
-		name     string
-		code     codes.Code
-		payload  []byte
-		token    string
-		options  map[message.OptionID]interface{}
+		name    string
+		code    codes.Code
+		payload []byte
+		token   string
+		options map[message.OptionID]interface{}
 	}{
 		{
 			name:    "GET request",
@@ -376,7 +376,7 @@ func TestErrorHandling(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var err error
-			
+
 			switch tt.errorCondition {
 			case "nil_message":
 				_, err = conv.MessageToCoAP(nil)
@@ -403,11 +403,11 @@ func validateOutputConfig(config OutputConfig) error {
 	if config.DefaultPath == "" {
 		return errors.New("default_path is required")
 	}
-	
+
 	if len(config.Endpoints) == 0 {
 		return errors.New("at least one endpoint is required")
 	}
-	
+
 	switch config.Protocol {
 	case "udp", "udp-dtls", "tcp", "tcp-tls":
 		// Valid protocols
@@ -416,12 +416,12 @@ func validateOutputConfig(config OutputConfig) error {
 	default:
 		return errors.New("unsupported protocol: " + config.Protocol)
 	}
-	
+
 	// Validate retry policy
 	if config.RetryPolicy.Multiplier > 0 && config.RetryPolicy.Multiplier < 1.0 {
 		return errors.New("retry multiplier must be >= 1.0")
 	}
-	
+
 	return nil
 }
 
@@ -430,15 +430,15 @@ func calculateRetryDelay(policy RetryPolicy, attempt int) time.Duration {
 	if attempt == 0 {
 		return policy.InitialInterval
 	}
-	
+
 	delay := policy.InitialInterval
 	for i := 0; i < attempt; i++ {
 		delay = time.Duration(float64(delay) * policy.Multiplier)
 	}
-	
+
 	if delay > policy.MaxInterval {
 		delay = policy.MaxInterval
 	}
-	
+
 	return delay
 }

@@ -392,7 +392,7 @@ func (o *Output) sendUDPMessage(ctx context.Context, conn *udpClient.Conn, coapM
 	req.SetCode(codes.POST) // Default to POST
 	req.SetType(coapMsg.Type)
 	req.SetToken(coapMsg.Token)
-	
+
 	// Set the path
 	if err := req.SetPath(path); err != nil {
 		o.metrics.MessagesFailed.Incr(1)
@@ -401,7 +401,7 @@ func (o *Output) sendUDPMessage(ctx context.Context, conn *udpClient.Conn, coapM
 
 	// Set payload using SetBody instead of SetPayload
 	req.SetBody(bytes.NewReader(coapMsg.Payload))
-	
+
 	// Copy content format if set
 	if len(coapMsg.Options) > 0 {
 		// Try to extract content format from options
@@ -453,7 +453,7 @@ func (o *Output) sendTCPMessage(ctx context.Context, conn *tcpClient.Conn, coapM
 	req.SetCode(codes.POST) // Default to POST
 	req.SetType(coapMsg.Type)
 	req.SetToken(coapMsg.Token)
-	
+
 	// Set the path
 	if err := req.SetPath(path); err != nil {
 		o.metrics.MessagesFailed.Incr(1)
@@ -462,7 +462,7 @@ func (o *Output) sendTCPMessage(ctx context.Context, conn *tcpClient.Conn, coapM
 
 	// Set payload using SetBody instead of SetPayload
 	req.SetBody(bytes.NewReader(coapMsg.Payload))
-	
+
 	// Copy content format if set
 	if len(coapMsg.Options) > 0 {
 		// Try to extract content format from options

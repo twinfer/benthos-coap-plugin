@@ -107,12 +107,12 @@ func init() {
 }
 
 type ServerInput struct {
-	server      *server.Server
-	udpConn     *coapNet.UDPConn  // CoAP UDP connection for server
-	converter   *converter.Converter
-	logger      *service.Logger
-	metrics     *ServerMetrics
-	config      ServerConfig
+	server    *server.Server
+	udpConn   *coapNet.UDPConn // CoAP UDP connection for server
+	converter *converter.Converter
+	logger    *service.Logger
+	metrics   *ServerMetrics
+	config    ServerConfig
 
 	msgChan   chan *service.Message
 	closeChan chan struct{}
@@ -123,25 +123,25 @@ type ServerInput struct {
 }
 
 type ServerConfig struct {
-	ListenAddress    string
-	Protocol         string
-	AllowedPaths     []string
-	AllowedMethods   []string
-	BufferSize       int
-	Timeout          time.Duration
-	SecurityConfig   SecurityConfig
-	ResponseConfig   ResponseConfig
-	ConverterConfig  converter.Config
+	ListenAddress   string
+	Protocol        string
+	AllowedPaths    []string
+	AllowedMethods  []string
+	BufferSize      int
+	Timeout         time.Duration
+	SecurityConfig  SecurityConfig
+	ResponseConfig  ResponseConfig
+	ConverterConfig converter.Config
 }
 
 type SecurityConfig struct {
-	Mode               string
-	PSKIdentity        string
-	PSKKey             string
-	CertFile           string
-	KeyFile            string
-	CACertFile         string
-	RequireClientCert  bool
+	Mode              string
+	PSKIdentity       string
+	PSKKey            string
+	CertFile          string
+	KeyFile           string
+	CACertFile        string
+	RequireClientCert bool
 }
 
 type ResponseConfig struct {
@@ -339,16 +339,16 @@ func (s *ServerInput) handleRequest(w mux.ResponseWriter, r *mux.Message) {
 	case s.msgChan <- benthosMsg:
 		s.metrics.RequestsProcessed.Incr(1)
 		s.logger.Debugf("Processed %s request for path %s", method, path)
-		
+
 		// Send default response
 		s.sendSuccessResponse(w)
 		s.metrics.ResponsesSent.Incr(1)
-		
+
 	case <-time.After(s.config.Timeout):
 		s.logger.Warnf("Timeout processing %s request for path %s", method, path)
 		s.sendErrorResponse(w, codes.ServiceUnavailable, "Service temporarily unavailable")
 		s.metrics.RequestsFailed.Incr(1)
-		
+
 	case <-s.closeChan:
 		s.logger.Debug("Server shutting down, rejecting request")
 		s.sendErrorResponse(w, codes.ServiceUnavailable, "Server shutting down")
@@ -437,7 +437,7 @@ func (s *ServerInput) isMethodAllowed(method string) bool {
 	if len(s.config.AllowedMethods) == 0 {
 		return true
 	}
-	
+
 	for _, allowed := range s.config.AllowedMethods {
 		if allowed == method {
 			return true
@@ -451,13 +451,13 @@ func (s *ServerInput) isPathAllowed(path string) bool {
 	if len(s.config.AllowedPaths) == 0 {
 		return true
 	}
-	
+
 	for _, allowed := range s.config.AllowedPaths {
 		// Try exact match first (fastest)
 		if allowed == path {
 			return true
 		}
-		
+
 		// Try pattern match if pattern contains wildcards
 		if s.containsWildcards(allowed) && s.matchesPattern(allowed, path) {
 			return true
@@ -473,18 +473,19 @@ func (s *ServerInput) containsWildcards(pattern string) bool {
 
 // matchesPattern checks if a path matches a wildcard pattern
 // Patterns:
-//   + matches exactly one path segment (between slashes)
-//   * matches zero or more path segments
+//   - matches exactly one path segment (between slashes)
+//   - matches zero or more path segments
 //
 // Examples:
-//   "/sensors/+" matches "/sensors/temp" but not "/sensors/temp/value"
-//   "/sensors/*" matches "/sensors/temp", "/sensors/temp/value", "/sensors/a/b/c"
-//   "/api/+/data" matches "/api/v1/data" but not "/api/v1/v2/data"
+//
+//	"/sensors/+" matches "/sensors/temp" but not "/sensors/temp/value"
+//	"/sensors/*" matches "/sensors/temp", "/sensors/temp/value", "/sensors/a/b/c"
+//	"/api/+/data" matches "/api/v1/data" but not "/api/v1/v2/data"
 func (s *ServerInput) matchesPattern(pattern, path string) bool {
 	// Split both pattern and path into segments
 	patternSegments := s.splitPath(pattern)
 	pathSegments := s.splitPath(path)
-	
+
 	return s.matchSegments(patternSegments, pathSegments)
 }
 
@@ -493,9 +494,9 @@ func (s *ServerInput) splitPath(path string) []string {
 	if path == "/" {
 		return []string{}
 	}
-	
+
 	segments := strings.Split(strings.Trim(path, "/"), "/")
-	
+
 	// Remove empty segments
 	var result []string
 	for _, segment := range segments {
@@ -503,7 +504,7 @@ func (s *ServerInput) splitPath(path string) []string {
 			result = append(result, segment)
 		}
 	}
-	
+
 	return result
 }
 
@@ -513,15 +514,15 @@ func (s *ServerInput) matchSegments(patternSegments, pathSegments []string) bool
 	if len(patternSegments) == 0 {
 		return len(pathSegments) == 0
 	}
-	
+
 	// If path is empty but pattern isn't, check if pattern can match empty
 	if len(pathSegments) == 0 {
 		// Only "*" at the end can match empty path
 		return len(patternSegments) == 1 && patternSegments[0] == "*"
 	}
-	
+
 	firstPattern := patternSegments[0]
-	
+
 	switch firstPattern {
 	case "+":
 		// + matches exactly one segment
@@ -530,7 +531,7 @@ func (s *ServerInput) matchSegments(patternSegments, pathSegments []string) bool
 		}
 		// Match this segment and continue with remaining
 		return s.matchSegments(patternSegments[1:], pathSegments[1:])
-		
+
 	case "*":
 		// * matches zero or more segments
 		// Try matching with 0, 1, 2, ... segments consumed by *
@@ -540,7 +541,7 @@ func (s *ServerInput) matchSegments(patternSegments, pathSegments []string) bool
 			}
 		}
 		return false
-		
+
 	default:
 		// Literal segment - must match exactly
 		if pathSegments[0] != firstPattern {

@@ -11,8 +11,8 @@ import (
 
 	"github.com/plgd-dev/go-coap/v3/message"
 	"github.com/plgd-dev/go-coap/v3/message/pool"
-	udpClient "github.com/plgd-dev/go-coap/v3/udp/client"
 	tcpClient "github.com/plgd-dev/go-coap/v3/tcp/client"
+	udpClient "github.com/plgd-dev/go-coap/v3/udp/client"
 	"github.com/redpanda-data/benthos/v4/public/service"
 
 	"github.com/twinfer/benthos-coap-plugin/pkg/connection"
@@ -243,7 +243,7 @@ func (m *Manager) performObserve(ctx context.Context, sub *Subscription) error {
 			Token:   notification.Token(),
 			Options: notification.Options(),
 		}
-		
+
 		// Copy payload from body
 		if body := notification.Body(); body != nil {
 			payload, err := io.ReadAll(body)
@@ -252,7 +252,7 @@ func (m *Manager) performObserve(ctx context.Context, sub *Subscription) error {
 			}
 			body.Seek(0, 0) // Reset for any future reads
 		}
-		
+
 		m.handleObserveMessage(sub.path, msg)
 	}
 
@@ -333,7 +333,7 @@ func (m *Manager) handleObserveMessage(path string, coapMsg *message.Message) {
 		m.logger.Warnf("Received message for unknown or removed subscription path: %s. Token: %s", path, string(coapMsg.Token))
 		return
 	}
-	
+
 	var endpoint string
 	if sub.conn != nil {
 		endpoint = sub.conn.Endpoint()
@@ -351,7 +351,7 @@ func (m *Manager) handleObserveMessage(path string, coapMsg *message.Message) {
 		m.logger.Errorf("Converter is nil, cannot convert CoAP message for path %s on %s", path, endpoint)
 		return
 	}
-	
+
 	benthosMsg, err := m.converter.CoAPToMessage(coapMsg)
 	if err != nil {
 		m.logger.Errorf("Failed to convert CoAP message to Benthos message for path %s on %s: %v", path, endpoint, err)

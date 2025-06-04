@@ -79,7 +79,7 @@ func TestServerConfigValidation(t *testing.T) {
 func TestMethodStringConversion(t *testing.T) {
 	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	conv := converter.NewConverter(converter.Config{}, logger)
-	
+
 	input := &ServerInput{
 		converter: conv,
 		logger:    logger,
@@ -108,12 +108,12 @@ func TestMethodStringConversion(t *testing.T) {
 func TestPathAndMethodAllowed(t *testing.T) {
 	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	conv := converter.NewConverter(converter.Config{}, logger)
-	
+
 	config := ServerConfig{
 		AllowedPaths:   []string{"/api/data", "/sensors/temp"},
 		AllowedMethods: []string{"GET", "POST"},
 	}
-	
+
 	input := &ServerInput{
 		converter: conv,
 		logger:    logger,
@@ -137,12 +137,12 @@ func TestPathAndMethodAllowed(t *testing.T) {
 func TestEmptyAllowedLists(t *testing.T) {
 	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	conv := converter.NewConverter(converter.Config{}, logger)
-	
+
 	config := ServerConfig{
 		AllowedPaths:   []string{}, // Empty means allow all
 		AllowedMethods: []string{}, // Empty means allow all
 	}
-	
+
 	input := &ServerInput{
 		converter: conv,
 		logger:    logger,
@@ -163,7 +163,7 @@ func TestEmptyAllowedLists(t *testing.T) {
 // TestServerMetrics tests metrics functionality
 func TestServerMetrics(t *testing.T) {
 	resources := service.MockResources()
-	
+
 	metrics := &ServerMetrics{
 		RequestsReceived:  resources.Metrics().NewCounter("test_requests_received"),
 		RequestsProcessed: resources.Metrics().NewCounter("test_requests_processed"),
@@ -191,13 +191,13 @@ func TestServerMetrics(t *testing.T) {
 func TestWildcardPathMatching(t *testing.T) {
 	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	conv := converter.NewConverter(converter.Config{}, logger)
-	
+
 	tests := []struct {
-		name          string
-		allowedPaths  []string
-		testPath      string
-		shouldAllow   bool
-		description   string
+		name         string
+		allowedPaths []string
+		testPath     string
+		shouldAllow  bool
+		description  string
 	}{
 		// Exact matches
 		{
@@ -214,7 +214,7 @@ func TestWildcardPathMatching(t *testing.T) {
 			shouldAllow:  false,
 			description:  "different path should not match",
 		},
-		
+
 		// Single segment wildcard (+)
 		{
 			name:         "single wildcard match",
@@ -251,7 +251,7 @@ func TestWildcardPathMatching(t *testing.T) {
 			shouldAllow:  false,
 			description:  "+ should not match multiple segments in middle",
 		},
-		
+
 		// Multi-segment wildcard (*)
 		{
 			name:         "multi wildcard match - single segment",
@@ -288,7 +288,7 @@ func TestWildcardPathMatching(t *testing.T) {
 			shouldAllow:  false,
 			description:  "* should not match different prefix",
 		},
-		
+
 		// Complex patterns
 		{
 			name:         "mixed wildcards",
@@ -304,7 +304,7 @@ func TestWildcardPathMatching(t *testing.T) {
 			shouldAllow:  false,
 			description:  "+ should not match multiple segments even with *",
 		},
-		
+
 		// Edge cases
 		{
 			name:         "root path exact",
@@ -348,7 +348,7 @@ func TestWildcardPathMatching(t *testing.T) {
 			shouldAllow:  false,
 			description:  "should not match if no patterns match",
 		},
-		
+
 		// Real-world IoT scenarios
 		{
 			name:         "device ID pattern",
@@ -372,19 +372,19 @@ func TestWildcardPathMatching(t *testing.T) {
 			description:  "API versioning patterns should work",
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			config := ServerConfig{
 				AllowedPaths: tt.allowedPaths,
 			}
-			
+
 			input := &ServerInput{
 				converter: conv,
 				logger:    logger,
 				config:    config,
 			}
-			
+
 			result := input.isPathAllowed(tt.testPath)
 			assert.Equal(t, tt.shouldAllow, result, tt.description)
 		})
@@ -395,12 +395,12 @@ func TestWildcardPathMatching(t *testing.T) {
 func TestWildcardHelperFunctions(t *testing.T) {
 	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	conv := converter.NewConverter(converter.Config{}, logger)
-	
+
 	input := &ServerInput{
 		converter: conv,
 		logger:    logger,
 	}
-	
+
 	t.Run("containsWildcards", func(t *testing.T) {
 		tests := []struct {
 			pattern  string
@@ -413,13 +413,13 @@ func TestWildcardHelperFunctions(t *testing.T) {
 			{"/exact/path", false},
 			{"", false},
 		}
-		
+
 		for _, tt := range tests {
 			result := input.containsWildcards(tt.pattern)
 			assert.Equal(t, tt.expected, result, "containsWildcards('%s') should be %v", tt.pattern, tt.expected)
 		}
 	})
-	
+
 	t.Run("splitPath", func(t *testing.T) {
 		tests := []struct {
 			path     string
@@ -429,17 +429,17 @@ func TestWildcardHelperFunctions(t *testing.T) {
 			{"/sensors", []string{"sensors"}},
 			{"/sensors/temperature", []string{"sensors", "temperature"}},
 			{"/api/v1/data", []string{"api", "v1", "data"}},
-			{"sensors/temperature", []string{"sensors", "temperature"}}, // no leading slash
+			{"sensors/temperature", []string{"sensors", "temperature"}},    // no leading slash
 			{"/sensors//temperature/", []string{"sensors", "temperature"}}, // extra slashes
 			{"", []string{}},
 		}
-		
+
 		for _, tt := range tests {
 			result := input.splitPath(tt.path)
 			assert.Equal(t, tt.expected, result, "splitPath('%s') should return %v", tt.path, tt.expected)
 		}
 	})
-	
+
 	t.Run("matchSegments", func(t *testing.T) {
 		tests := []struct {
 			name            string
@@ -457,7 +457,7 @@ func TestWildcardHelperFunctions(t *testing.T) {
 			{"* matches multiple", []string{"sensors", "*"}, []string{"sensors", "temp", "value"}, true},
 			{"* matches zero", []string{"sensors", "*"}, []string{"sensors"}, true},
 		}
-		
+
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				result := input.matchSegments(tt.patternSegments, tt.pathSegments)
@@ -473,19 +473,19 @@ func TestConfigParsing(t *testing.T) {
 		// Create a mock config that would return "none" for security.mode
 		// This is a simplified test since we can't easily mock service.ParsedConfig
 		config := SecurityConfig{Mode: "none"}
-		
+
 		assert.Equal(t, "none", config.Mode)
 		assert.Empty(t, config.PSKIdentity)
 		assert.Empty(t, config.PSKKey)
 	})
-	
+
 	t.Run("parseResponseConfig", func(t *testing.T) {
 		config := ResponseConfig{
 			DefaultContentFormat: "text/plain",
 			DefaultCode:          codes.Content,
 			DefaultPayload:       "OK",
 		}
-		
+
 		assert.Equal(t, "text/plain", config.DefaultContentFormat)
 		assert.Equal(t, codes.Content, config.DefaultCode)
 		assert.Equal(t, "OK", config.DefaultPayload)

@@ -213,7 +213,7 @@ func (m *MockCoAPServer) setResponseWithOptions(w mux.ResponseWriter, code codes
 func (m *MockCoAPServer) captureRequestDetails(path string, req *pool.Message) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	// Get options from pool.Message
 	opts := req.Options()
 	optsCopy := make([]message.Option, 0, len(opts))
@@ -230,7 +230,7 @@ func (m *MockCoAPServer) captureRequestDetails(path string, req *pool.Message) {
 		}
 	}
 
-	// Store a copy of the message  
+	// Store a copy of the message
 	msgCopy := &message.Message{
 		Code:    req.Code(),
 		Token:   req.Token(),

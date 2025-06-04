@@ -95,7 +95,7 @@ func (c *Converter) MessageToCoAP(msg *service.Message) (*message.Message, error
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine content format: %w", err)
 	}
-	
+
 	// Set payload
 	payload, err := msg.AsBytes()
 	if err != nil {
