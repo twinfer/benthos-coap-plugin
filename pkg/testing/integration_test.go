@@ -109,73 +109,72 @@ protocol: "udp"
 		// Verify metadata
 		assert.Equal(t, "/sensors/temp", msg.MetaGetOr("coap_path", ""))
 
-	// --- Test Update ---
-	t.Log("Updating resource on mock server...")
-	updatedData := map[string]interface{}{
-		"temperature": 25.0, // New temperature
-		"humidity":    60.0, // New humidity
-		"status":      "active",
-		"timestamp":   time.Now().Unix(),
-	}
-	jsonUpdatedData, err := json.Marshal(updatedData)
-	require.NoError(t, err)
-	require.NoError(t, server.UpdateResource("/sensors/temp", jsonUpdatedData))
-
-	// Wait for observe update message
-	select {
-	case updatedMsg := <-obsManager.MessageChan():
-		require.NotNil(t, updatedMsg)
-		payload, err := updatedMsg.AsBytes()
+		// --- Test Update ---
+		t.Log("Updating resource on mock server...")
+		updatedData := map[string]interface{}{
+			"temperature": 25.0, // New temperature
+			"humidity":    60.0, // New humidity
+			"status":      "active",
+			"timestamp":   time.Now().Unix(),
+		}
+		jsonUpdatedData, err := json.Marshal(updatedData)
 		require.NoError(t, err)
-		var receivedUpdatedData map[string]interface{}
-		require.NoError(t, json.Unmarshal(payload, &receivedUpdatedData))
+		require.NoError(t, server.UpdateResource("/sensors/temp", jsonUpdatedData))
 
-		assert.Equal(t, updatedData["temperature"], receivedUpdatedData["temperature"])
-		assert.Equal(t, updatedData["humidity"], receivedUpdatedData["humidity"])
-		assert.Equal(t, updatedData["status"], receivedUpdatedData["status"])
-		assert.Equal(t, "/sensors/temp", updatedMsg.MetaGetOr("coap_path", ""))
+		// Wait for observe update message
+		select {
+		case updatedMsg := <-obsManager.MessageChan():
+			require.NotNil(t, updatedMsg)
+			payload, err := updatedMsg.AsBytes()
+			require.NoError(t, err)
+			var receivedUpdatedData map[string]interface{}
+			require.NoError(t, json.Unmarshal(payload, &receivedUpdatedData))
 
-		// Check observe sequence number if available (it should be higher)
-		observeSeqStr := updatedMsg.MetaGetOr("coap_observe", "0")
-		observeSeq, _ := parseInt(observeSeqStr) // Helper needed for parsing int
-		assert.Greater(t, observeSeq, uint32(0), "Observe sequence should be greater than initial")
+			assert.Equal(t, updatedData["temperature"], receivedUpdatedData["temperature"])
+			assert.Equal(t, updatedData["humidity"], receivedUpdatedData["humidity"])
+			assert.Equal(t, updatedData["status"], receivedUpdatedData["status"])
+			assert.Equal(t, "/sensors/temp", updatedMsg.MetaGetOr("coap_path", ""))
 
-	case <-time.After(10 * time.Second):
-		t.Fatal("Timeout waiting for CoAP update message")
-	case <-ctx.Done():
-		t.Fatal("Context cancelled during update wait")
-	}
+			// Check observe sequence number if available (it should be higher)
+			observeSeqStr := updatedMsg.MetaGetOr("coap_observe", "0")
+			observeSeq, _ := parseInt(observeSeqStr) // Helper needed for parsing int
+			assert.Greater(t, observeSeq, uint32(0), "Observe sequence should be greater than initial")
 
-	// --- Test Cancellation ---
-	t.Log("Testing observation cancellation...")
-	initialObserverCount := server.GetObserverCount("/sensors/temp")
-	assert.GreaterOrEqual(t, initialObserverCount, 1, "Should have at least one observer before closing manager")
+		case <-time.After(10 * time.Second):
+			t.Fatal("Timeout waiting for CoAP update message")
+		case <-ctx.Done():
+			t.Fatal("Context cancelled during update wait")
+		}
 
-	// Closing the obsManager should cancel the observation
-	require.NoError(t, obsManager.Close()) // Close the specific observer manager
+		// --- Test Cancellation ---
+		t.Log("Testing observation cancellation...")
+		initialObserverCount := server.GetObserverCount("/sensors/temp")
+		assert.GreaterOrEqual(t, initialObserverCount, 1, "Should have at least one observer before closing manager")
 
-	// Wait a bit for cancellation to propagate and be processed by server
-	// The mock server's sendObserveNotification sets observer.Active = false if write fails (e.g. conn closed)
-	// but there's no explicit deregistration message sent by go-coap v3 client on observation cancel by default.
-	// Effective cancellation means the client stops listening and processing.
-	// We can check if the server *would* try to send to fewer observers or if our client stops.
-	// For this test, we'll assume closing the manager stops further processing of messages.
-	// A more robust server-side check would be if the mock server detected the connection drop.
-	// Here, we'll verify that no new messages arrive after closing.
+		// Closing the obsManager should cancel the observation
+		require.NoError(t, obsManager.Close()) // Close the specific observer manager
 
-	server.UpdateResource("/sensors/temp", []byte(`{"status":"final"}`)) // Another update
-	select {
-	case msgAfterClose := <-obsManager.MessageChan():
-		t.Fatalf("Received message after closing observer manager: %v", msgAfterClose)
-	case <-time.After(200 * time.Millisecond):
-		// Expected: no message after close
-	}
+		// Wait a bit for cancellation to propagate and be processed by server
+		// The mock server's sendObserveNotification sets observer.Active = false if write fails (e.g. conn closed)
+		// but there's no explicit deregistration message sent by go-coap v3 client on observation cancel by default.
+		// Effective cancellation means the client stops listening and processing.
+		// We can check if the server *would* try to send to fewer observers or if our client stops.
+		// For this test, we'll assume closing the manager stops further processing of messages.
+		// A more robust server-side check would be if the mock server detected the connection drop.
+		// Here, we'll verify that no new messages arrive after closing.
+
+		server.UpdateResource("/sensors/temp", []byte(`{"status":"final"}`)) // Another update
+		select {
+		case msgAfterClose := <-obsManager.MessageChan():
+			t.Fatalf("Received message after closing observer manager: %v", msgAfterClose)
+		case <-time.After(200 * time.Millisecond):
+			// Expected: no message after close
+		}
 	// Note: GetObserverCount might not change immediately on client-side cancel if no deregister is sent.
 	// The test for cancellation is more about the client (Benthos input) stopping reception.
 
 	// Clean up main context for any remaining goroutines tied to it.
 	// cancel() is already deferred.
-
 
 	case <-time.After(10 * time.Second):
 		t.Fatal("Timeout waiting for CoAP message")
@@ -419,11 +418,10 @@ converter:
 	// This is a simplified way to get an Output instance for testing its Write method directly.
 	// A full Benthos pipeline test would use service.RunIntegrationSuite.
 	outputPluginConfig := observer.ConfigSpec(). // Using observer's spec just to get a ParsedConfig
-								Field(service.NewStringField("log.level").Default("DEBUG")) // Add if logger expects it
+							Field(service.NewStringField("log.level").Default("DEBUG")) // Add if logger expects it
 
 	parsedOutputConf, err := outputPluginConfig.ParseYAML(outputConfYAML, nil)
 	require.NoError(t, err)
-
 
 	// Create the output instance (simplified for direct testing of Write method)
 	// This directly calls the constructor, bypassing full Benthos component registration.
@@ -441,12 +439,11 @@ converter:
 			Timeout:     5 * time.Second,
 		},
 		Converter: converter.Config{ // Ensure converter config is passed
-			PreserveOptions: true, // Critical for coap_option_*
+			PreserveOptions:      true, // Critical for coap_option_*
 			DefaultContentFormat: "application/json",
 		},
 		// Security and ConnectionPool can use defaults if not focus of test
 	}
-
 
 	coapOutput := &output.Output{} // Create an empty struct
 
@@ -580,7 +577,6 @@ output:
 	}
 	assert.True(t, cfFound, "Content-Format option not found")
 
-
 	// Verify Custom Option 2000 (should have two instances)
 	var customOptValues [][]byte
 	for _, opt := range receivedOpts {
@@ -602,7 +598,7 @@ func TestCoAPInputOutputOptionPreservationIntegration(t *testing.T) {
 	// Options to be served by Server A with the resource
 	serveOptsA := []message.Option{
 		{ID: message.ETag, Value: []byte("etagA123")},
-		{ID: message.MaxAge, Value: []byte{0x3C}}, // 60 seconds
+		{ID: message.MaxAge, Value: []byte{0x3C}},                        // 60 seconds
 		{ID: message.OptionID(2500), Value: []byte("customObserveOptA")}, // Custom option
 	}
 	serverA.AddResource(resourcePathA, message.AppJSON, initialDataA, true, serveOptsA...)
@@ -638,10 +634,9 @@ output:
 
 	// Register input (if not already globally registered by other tests, safe to do again)
 	require.NoError(t, service.RegisterInput("coap", observer.ConfigSpec(),
-	func(conf *service.ParsedConfig, mgr *service.Resources) (service.Input, error) {
-		return observer.NewCoAPInput(conf, mgr)
-	}))
-
+		func(conf *service.ParsedConfig, mgr *service.Resources) (service.Input, error) {
+			return observer.NewCoAPInput(conf, mgr)
+		}))
 
 	stream := service.NewStream()
 	require.NoError(t, stream.SetYAML(streamConf))
@@ -708,13 +703,12 @@ output:
 	_, foundAtPathA_on_B := serverB.GetResourceLastPutOrPostOptions(resourcePathA)
 	assert.True(t, foundAtPathA_on_B, "Message on Server B should be at original path %s due to coap_path preservation", resourcePathA)
 
-
 	// --- Test with an update from Server A ---
 	t.Log("Updating resource on Server A to test propagation of new data and options")
 	updatedDataA := []byte(`{"version":2, "power":"off"}`)
 	updatedServeOptsA := []message.Option{
 		{ID: message.ETag, Value: []byte("etagA_v2")}, // New ETag
-		{ID: message.MaxAge, Value: []byte{0x1E}},      // 30 seconds
+		{ID: message.MaxAge, Value: []byte{0x1E}},     // 30 seconds
 		{ID: message.OptionID(2500), Value: []byte("customObserveOptA_v2")},
 	}
 	require.NoError(t, serverA.UpdateResource(resourcePathA, updatedDataA, updatedServeOptsA...))
@@ -757,7 +751,6 @@ output:
 	}
 	assert.True(t, foundCustomOptV2, "Custom Option 2500 v2 not found on Server B")
 
-
 	// Stop the stream by cancelling context
 	cancel()
 	err = <-runErrChan
@@ -765,7 +758,6 @@ output:
 		require.NoError(t, err, "Stream.Run returned an unexpected error on close")
 	}
 }
-
 
 // Helper to indent YAML block
 func indentYAML(yamlBlock, indent string) string {
@@ -776,7 +768,6 @@ func indentYAML(yamlBlock, indent string) string {
 	}
 	return strings.Join(indentedLines, "\n")
 }
-
 
 func BenchmarkCoAPThroughput(b *testing.B) {
 	server := NewMockCoAPServer()

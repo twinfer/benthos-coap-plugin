@@ -2,6 +2,7 @@
 package testing
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -10,29 +11,33 @@ import (
 	"github.com/plgd-dev/go-coap/v3/message"
 	"github.com/plgd-dev/go-coap/v3/message/codes"
 	"github.com/plgd-dev/go-coap/v3/mux"
+	"github.com/plgd-dev/go-coap/v3/net/monitor/inactivity"
 	"github.com/plgd-dev/go-coap/v3/udp"
+	"github.com/plgd-dev/go-coap/v3/udp/client"
 )
 
 // MockCoAPServer provides a test CoAP server for integration testing
 type MockCoAPServer struct {
-	server    *udp.Server
-	addr      string
+	addr                 string
+	listener             *net.UDPConn
+	server               *udp.Server
 	resources            map[string]*MockResource
 	observers            map[string][]Observer
 	lastReceivedOptions  map[string][]message.Option // Keyed by path
 	lastReceivedMessages map[string]*message.Message // Keyed by path, stores the last message
 	mu                   sync.RWMutex
 	running              bool
+	cancel               context.CancelFunc
 }
 
 type MockResource struct {
-	Path                string
-	ContentType         message.MediaType
-	Data                []byte
-	Observable          bool
-	ObserveSeq          uint32
-	LastModified        time.Time
-	ServeWithOptions    []message.Option // Options to serve on GET for this resource
+	Path                 string
+	ContentType          message.MediaType
+	Data                 []byte
+	Observable           bool
+	ObserveSeq           uint32
+	LastModified         time.Time
+	ServeWithOptions     []message.Option // Options to serve on GET for this resource
 	LastPutOrPostOptions []message.Option // Options from the last PUT or POST request
 }
 
@@ -97,20 +102,28 @@ func (m *MockCoAPServer) UpdateResource(path string, data []byte, newOpts ...mes
 }
 
 func (m *MockCoAPServer) Start() error {
-	listener, err := net.ListenUDP("udp", &net.UDPAddr{})
+	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
 		return fmt.Errorf("failed to create UDP listener: %w", err)
 	}
 
+	m.listener = listener
 	m.addr = listener.LocalAddr().String()
 
 	router := mux.NewRouter()
 	router.Handle("/", mux.HandlerFunc(m.handleRequest))
 
-	m.server = udp.NewServer(udp.WithMux(router))
+	// Create server with proper go-coap v3 configuration
+	m.server = udp.NewServer(
+		udp.WithMux(router),
+		udp.WithInactivityMonitor(100*time.Millisecond, inactivity.NewNilMonitor()),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel = cancel
 
 	go func() {
-		if err := m.server.Serve(listener); err != nil {
+		if err := m.server.Serve(listener); err != nil && ctx.Err() == nil {
 			fmt.Printf("CoAP server error: %v\n", err)
 		}
 	}()
@@ -125,7 +138,14 @@ func (m *MockCoAPServer) Stop() error {
 	}
 
 	m.running = false
-	return m.server.Close()
+	if m.cancel != nil {
+		m.cancel()
+	}
+
+	if m.server != nil {
+		return m.server.Close()
+	}
+	return nil
 }
 
 func (m *MockCoAPServer) Addr() string {
@@ -133,7 +153,11 @@ func (m *MockCoAPServer) Addr() string {
 }
 
 func (m *MockCoAPServer) handleRequest(w mux.ResponseWriter, r *mux.Message) {
-	path := "/" + r.Route()
+	// Extract path from Uri-Path options
+	path, err := r.Options.Path()
+	if err != nil || path == "" {
+		path = "/"
+	}
 
 	switch r.Code() {
 	case codes.GET:
@@ -145,7 +169,7 @@ func (m *MockCoAPServer) handleRequest(w mux.ResponseWriter, r *mux.Message) {
 		m.captureRequestDetails(path, r.Message)
 		m.handlePut(w, r, path)
 	case codes.DELETE:
-		m.captureRequestDetails(path, r.Message) // Might be useful to know options on DELETE too
+		m.captureRequestDetails(path, r.Message)
 		m.handleDelete(w, r, path)
 	default:
 		w.SetResponse(codes.MethodNotAllowed, message.TextPlain, nil)
@@ -163,7 +187,7 @@ func (m *MockCoAPServer) handleGet(w mux.ResponseWriter, r *mux.Message, path st
 	}
 
 	// Check for observe option
-	if observe, err := r.Options().GetUint32(message.Observe); err == nil && observe == 0 {
+	if observe, err := r.Options.GetUint32(message.Observe); err == nil && observe == 0 {
 		if resource.Observable {
 			m.addObserver(path, r.Token(), w)
 			m.setResponseWithOptions(w, codes.Content, resource.ContentType, resource.Data, resource.ServeWithOptions)
@@ -183,23 +207,26 @@ func (m *MockCoAPServer) setResponseWithOptions(w mux.ResponseWriter, code codes
 	}
 }
 
-
 func (m *MockCoAPServer) captureRequestDetails(path string, req *message.Message) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// Deep copy options to avoid issues with buffer reuse by the CoAP library
-	optsCopy := make([]message.Option, 0, len(req.Options()))
-	for _, opt := range req.Options() {
+	optsCopy := make([]message.Option, 0, len(req.Options))
+	for _, opt := range req.Options {
 		optsCopy = append(optsCopy, message.Option{ID: opt.ID, Value: append([]byte(nil), opt.Value...)})
 	}
 	m.lastReceivedOptions[path] = optsCopy
 
-	// Store a copy of the message (optional, if full message inspection is needed later)
-	// Be careful with message pools if you store the message directly.
-	// For simplicity, just options are stored for now.
-	// If storing req, ensure it's cloned or its context handled.
+	// Store a copy of the message
+	msgCopy := &message.Message{
+		Code:    req.Code,
+		Token:   req.Token,
+		Type:    req.Type,
+		Options: optsCopy,
+		Payload: append([]byte(nil), req.Payload...),
+	}
+	m.lastReceivedMessages[path] = msgCopy
 }
-
 
 func (m *MockCoAPServer) handlePost(w mux.ResponseWriter, r *mux.Message, path string) {
 	m.mu.Lock()
@@ -208,13 +235,12 @@ func (m *MockCoAPServer) handlePost(w mux.ResponseWriter, r *mux.Message, path s
 		resource = &MockResource{Path: path, Observable: false} // Default to not observable for POST-created
 		m.resources[path] = resource
 	}
-	resource.LastPutOrPostOptions = r.Options() // Store options from this request
+	resource.LastPutOrPostOptions = r.Options // Store options from this request
 	m.mu.Unlock()
 
-
-	data := r.Payload()
+	data := r.Payload
 	contentType := message.AppOctets
-	if cf, err := r.Options().GetUint32(message.ContentFormat); err == nil {
+	if cf, err := r.Options.GetUint32(message.ContentFormat); err == nil {
 		contentType = message.MediaType(cf)
 	}
 
@@ -224,11 +250,9 @@ func (m *MockCoAPServer) handlePost(w mux.ResponseWriter, r *mux.Message, path s
 	resource.LastModified = time.Now()
 
 	// If it was observable, and content changed, we might want to notify observers
-	// For simplicity, POST creating/updating an observable resource would also trigger notifications
 	if resource.Observable {
 		m.UpdateResource(path, data) // This will also handle notifications
 	}
-
 
 	w.SetResponse(codes.Created, message.TextPlain, nil)
 }
@@ -241,12 +265,12 @@ func (m *MockCoAPServer) handlePut(w mux.ResponseWriter, r *mux.Message, path st
 		resource = &MockResource{Path: path, Observable: false}
 		m.resources[path] = resource
 	}
-	resource.LastPutOrPostOptions = r.Options()
+	resource.LastPutOrPostOptions = r.Options
 	m.mu.Unlock()
 
-	data := r.Payload()
+	data := r.Payload
 	contentType := message.AppOctets
-	if cf, err := r.Options().GetUint32(message.ContentFormat); err == nil {
+	if cf, err := r.Options.GetUint32(message.ContentFormat); err == nil {
 		contentType = message.MediaType(cf)
 	}
 
@@ -260,7 +284,6 @@ func (m *MockCoAPServer) handlePut(w mux.ResponseWriter, r *mux.Message, path st
 		w.SetResponse(codes.InternalServerError, message.TextPlain, []byte("failed to update after ensuring resource exists"))
 		return
 	}
-
 
 	w.SetResponse(codes.Changed, message.TextPlain, nil)
 }
@@ -300,10 +323,6 @@ func (m *MockCoAPServer) sendObserveNotification(observer *Observer, resource *M
 	// Set all options defined for the resource, then override with Observe
 	m.setResponseWithOptions(observer.Response, codes.Content, resource.ContentType, resource.Data, resource.ServeWithOptions)
 	observer.Response.SetOptionUint32(message.Observe, resource.ObserveSeq) // Ensure Observe option is set for notification
-
-	// The actual sending of the response is handled by the go-coap library
-	// after this handler returns. If observer.Response.SetResponse itself returned an error,
-	// it would mean the connection is likely closed or in an error state.
 }
 
 // Test utilities
@@ -346,14 +365,140 @@ func (m *MockCoAPServer) GetLastReceivedOptionsForPath(path string) ([]message.O
 }
 
 func (m *MockCoAPServer) GetResourceLastPutOrPostOptions(path string) ([]message.Option, bool) {
-    m.mu.RLock()
-    defer m.mu.RUnlock()
-    resource, exists := m.resources[path]
-    if !exists || resource.LastPutOrPostOptions == nil {
-        return nil, false
-    }
-    // Return a copy
-    optsCopy := make([]message.Option, len(resource.LastPutOrPostOptions))
-    copy(optsCopy, resource.LastPutOrPostOptions)
-    return optsCopy, true
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	resource, exists := m.resources[path]
+	if !exists || resource.LastPutOrPostOptions == nil {
+		return nil, false
+	}
+	// Return a copy
+	optsCopy := make([]message.Option, len(resource.LastPutOrPostOptions))
+	copy(optsCopy, resource.LastPutOrPostOptions)
+	return optsCopy, true
+}
+
+// MockCoAPClient provides a simple client for testing
+type MockCoAPClient struct {
+	serverAddr string
+	client     *client.Conn
+}
+
+func NewMockCoAPClient(serverAddr string) *MockCoAPClient {
+	return &MockCoAPClient{
+		serverAddr: serverAddr,
+	}
+}
+
+func (c *MockCoAPClient) Connect(ctx context.Context) error {
+	conn, err := udp.Dial(c.serverAddr)
+	if err != nil {
+		return fmt.Errorf("failed to connect to server: %w", err)
+	}
+	c.client = conn
+	return nil
+}
+
+func (c *MockCoAPClient) Close() error {
+	if c.client != nil {
+		return c.client.Close()
+	}
+	return nil
+}
+
+func (c *MockCoAPClient) Get(ctx context.Context, path string) (*message.Message, error) {
+	if c.client == nil {
+		return nil, fmt.Errorf("client not connected")
+	}
+
+	msg := &message.Message{
+		Code:  codes.GET,
+		Token: message.Token("test-get"),
+		Type:  message.Confirmable,
+	}
+
+	// Set path option
+	buf := make([]byte, 256)
+	msg.Options, _, _ = msg.Options.SetPath(buf, path)
+
+	resp, err := c.client.Do(msg)
+	if err != nil {
+		return nil, fmt.Errorf("GET request failed: %w", err)
+	}
+
+	return resp, nil
+}
+
+func (c *MockCoAPClient) Post(ctx context.Context, path string, contentType message.MediaType, payload []byte) (*message.Message, error) {
+	if c.client == nil {
+		return nil, fmt.Errorf("client not connected")
+	}
+
+	msg := &message.Message{
+		Code:    codes.POST,
+		Token:   message.Token("test-post"),
+		Type:    message.Confirmable,
+		Payload: payload,
+	}
+
+	// Set path and content format options
+	buf := make([]byte, 256)
+	msg.Options, _, _ = msg.Options.SetPath(buf, path)
+	buf2 := make([]byte, 256)
+	msg.Options, _, _ = msg.Options.SetContentFormat(buf2, contentType)
+
+	resp, err := c.client.Do(msg)
+	if err != nil {
+		return nil, fmt.Errorf("POST request failed: %w", err)
+	}
+
+	return resp, nil
+}
+
+func (c *MockCoAPClient) Put(ctx context.Context, path string, contentType message.MediaType, payload []byte) (*message.Message, error) {
+	if c.client == nil {
+		return nil, fmt.Errorf("client not connected")
+	}
+
+	msg := &message.Message{
+		Code:    codes.PUT,
+		Token:   message.Token("test-put"),
+		Type:    message.Confirmable,
+		Payload: payload,
+	}
+
+	// Set path and content format options
+	buf := make([]byte, 256)
+	msg.Options, _, _ = msg.Options.SetPath(buf, path)
+	buf2 := make([]byte, 256)
+	msg.Options, _, _ = msg.Options.SetContentFormat(buf2, contentType)
+
+	resp, err := c.client.Do(msg)
+	if err != nil {
+		return nil, fmt.Errorf("PUT request failed: %w", err)
+	}
+
+	return resp, nil
+}
+
+func (c *MockCoAPClient) Delete(ctx context.Context, path string) (*message.Message, error) {
+	if c.client == nil {
+		return nil, fmt.Errorf("client not connected")
+	}
+
+	msg := &message.Message{
+		Code:  codes.DELETE,
+		Token: message.Token("test-delete"),
+		Type:  message.Confirmable,
+	}
+
+	// Set path option
+	buf := make([]byte, 256)
+	msg.Options, _, _ = msg.Options.SetPath(buf, path)
+
+	resp, err := c.client.Do(msg)
+	if err != nil {
+		return nil, fmt.Errorf("DELETE request failed: %w", err)
+	}
+
+	return resp, nil
 }

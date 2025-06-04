@@ -81,11 +81,10 @@ func (c *Converter) MessageToCoAP(msg *service.Message) (*message.Message, error
 		return nil, fmt.Errorf("Benthos message is nil")
 	}
 
-	// Create CoAP message
-	coapMsg := &message.Message{}
-
-	// Set message type to Confirmable by default
-	coapMsg.Type = message.Confirmable
+	// Create a new CoAP message
+	coapMsg := &message.Message{
+		Type: message.Confirmable, // Default to Confirmable
+	}
 
 	// Set method from metadata or default to POST
 	method := c.getMethodFromMetadata(msg)
@@ -96,18 +95,7 @@ func (c *Converter) MessageToCoAP(msg *service.Message) (*message.Message, error
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine content format: %w", err)
 	}
-	// Set the ContentFormat option on the CoAP message
-	// If no specific format is determined (e.g. AppOctets is default), it might be omitted
-	// or explicitly set depending on desired behavior. go-coap typically defaults to
-	// no format or application/octet-stream if payload is present but no format is set.
-	// For clarity and to ensure what Benthos determined is sent, we set it.
-	if err := coapMsg.SetOptionUint32(message.ContentFormat, contentFormatValue); err != nil {
-		// This error might occur if the option ID is invalid or value is out of range,
-		// though unlikely for standard ContentFormat.
-		c.logger.Warnf("Failed to set CoAP ContentFormat option: %v", err)
-		// Depending on strictness, might return error: return nil, fmt.Errorf("failed to set content format option: %w", err)
-	}
-
+	
 	// Set payload
 	payload, err := msg.AsBytes()
 	if err != nil {
@@ -130,6 +118,14 @@ func (c *Converter) MessageToCoAP(msg *service.Message) (*message.Message, error
 	}
 
 	coapMsg.Payload = payload
+
+	// Set the ContentFormat option
+	buf := make([]byte, 32) // Allocate buffer for option encoding
+	var err2 error
+	coapMsg.Options, _, err2 = coapMsg.Options.SetContentFormat(buf, message.MediaType(contentFormatValue))
+	if err2 != nil {
+		c.logger.Warnf("Failed to set CoAP ContentFormat option: %v", err2)
+	}
 
 	// Add options from metadata
 	c.addOptionsFromMetadata(coapMsg, msg)
@@ -358,7 +354,10 @@ func (c *Converter) mimeTypeToContentFormat(mimeType string) uint32 {
 func (c *Converter) addOptionsFromMetadata(coapMsg *message.Message, msg *service.Message) {
 	// Handle explicitly set URI path
 	if uriPath, exists := msg.MetaGet("coap_uri_path"); exists {
-		if err := coapMsg.SetPathString(strings.Trim(uriPath, "/")); err != nil {
+		var err error
+		pathBuf := make([]byte, 256) // Fresh buffer for path
+		coapMsg.Options, _, err = coapMsg.Options.SetPath(pathBuf, strings.TrimPrefix(uriPath, "/"))
+		if err != nil {
 			c.logger.Warnf("Failed to set CoAP URI Path from 'coap_uri_path' metadata: %v", err)
 		}
 	}
@@ -367,8 +366,11 @@ func (c *Converter) addOptionsFromMetadata(coapMsg *message.Message, msg *servic
 	if uriQueryStr, exists := msg.MetaGet("coap_uri_query"); exists {
 		queries := strings.Split(uriQueryStr, "&")
 		for _, q := range queries {
-			if err := coapMsg.AddOptionString(message.URIQuery, q); err != nil {
-				c.logger.Warnf("Failed to add CoAP URI Query from 'coap_uri_query' metadata: %v", err)
+			var err error
+			queryBuf := make([]byte, 256) // Fresh buffer for each query
+			coapMsg.Options, _, err = coapMsg.Options.AddString(queryBuf, message.URIQuery, q)
+			if err != nil {
+				c.logger.Warnf("Failed to add URI query '%s': %v", q, err)
 			}
 		}
 	}
@@ -376,8 +378,11 @@ func (c *Converter) addOptionsFromMetadata(coapMsg *message.Message, msg *servic
 	// Max-Age
 	if maxAgeStr, exists := msg.MetaGet("coap_max_age"); exists {
 		if maxAgeVal, err := strconv.ParseUint(maxAgeStr, 10, 32); err == nil {
-			if err := coapMsg.SetOptionUint32(message.MaxAge, uint32(maxAgeVal)); err != nil {
-				c.logger.Warnf("Failed to set CoAP Max-Age option from metadata: %v", err)
+			var err2 error
+			maxAgeBuf := make([]byte, 256)
+			coapMsg.Options, _, err2 = coapMsg.Options.SetUint32(maxAgeBuf, message.MaxAge, uint32(maxAgeVal))
+			if err2 != nil {
+				c.logger.Warnf("Failed to set CoAP Max-Age option from metadata: %v", err2)
 			}
 		} else {
 			c.logger.Warnf("Failed to parse 'coap_max_age' metadata value '%s' as uint32: %v", maxAgeStr, err)
@@ -387,7 +392,10 @@ func (c *Converter) addOptionsFromMetadata(coapMsg *message.Message, msg *servic
 	// ETag
 	if etagStr, exists := msg.MetaGet("coap_etag"); exists {
 		// Assuming ETag in metadata is a direct string. If it can be hex, add decoding.
-		if err := coapMsg.SetOptionBytes(message.ETag, []byte(etagStr)); err != nil { // ETag is typically a single option in requests
+		var err error
+		etagBuf := make([]byte, 256)
+		coapMsg.Options, _, err = coapMsg.Options.SetBytes(etagBuf, message.ETag, []byte(etagStr))
+		if err != nil {
 			c.logger.Warnf("Failed to set CoAP ETag option from metadata: %v", err)
 		}
 	}
@@ -406,7 +414,10 @@ func (c *Converter) addOptionsFromMetadata(coapMsg *message.Message, msg *servic
 			c.logger.Warnf("Invalid value for 'coap_observe_request': %s. Expected 'register', 'deregister', '0', or '1'.", obsReqStr)
 		}
 		if setObs {
-			if err := coapMsg.SetOptionUint32(message.Observe, obsVal); err != nil {
+			var err error
+			observeBuf := make([]byte, 256)
+			coapMsg.Options, _, err = coapMsg.Options.SetUint32(observeBuf, message.Observe, obsVal)
+			if err != nil {
 				c.logger.Warnf("Failed to set CoAP Observe option from metadata: %v", err)
 			}
 		}
@@ -414,9 +425,12 @@ func (c *Converter) addOptionsFromMetadata(coapMsg *message.Message, msg *servic
 
 	// Accept
 	if acceptStr, exists := msg.MetaGet("coap_accept"); exists {
-		if acceptVal, err := strconv.ParseUint(acceptStr, 10, 16); err == nil { // Accept option is uint16 in some contexts, but go-coap uses uint32 for SetOptionUint32
-			if err := coapMsg.SetOptionUint32(message.Accept, uint32(acceptVal)); err != nil {
-				c.logger.Warnf("Failed to set CoAP Accept option from metadata: %v", err)
+		if acceptVal, err := strconv.ParseUint(acceptStr, 10, 16); err == nil {
+			var err2 error
+			acceptBuf := make([]byte, 256)
+			coapMsg.Options, _, err2 = coapMsg.Options.SetAccept(acceptBuf, message.MediaType(acceptVal))
+			if err2 != nil {
+				c.logger.Warnf("Failed to set CoAP Accept option from metadata: %v", err2)
 			}
 		} else {
 			c.logger.Warnf("Failed to parse 'coap_accept' metadata value '%s' as uint16/uint32: %v", acceptStr, err)
@@ -429,8 +443,11 @@ func (c *Converter) addOptionsFromMetadata(coapMsg *message.Message, msg *servic
 		// CoAP spec allows multiple If-Match options.
 		decodedVal, err := hex.DecodeString(ifMatchStr)
 		if err == nil {
-			if err := coapMsg.AddOptionBytes(message.IfMatch, decodedVal); err != nil {
-				c.logger.Warnf("Failed to set CoAP If-Match option from metadata: %v", err)
+			var err2 error
+			ifMatchBuf := make([]byte, 256)
+			coapMsg.Options, _, err2 = coapMsg.Options.AddBytes(ifMatchBuf, message.IfMatch, decodedVal)
+			if err2 != nil {
+				c.logger.Warnf("Failed to set CoAP If-Match option from metadata: %v", err2)
 			}
 		} else {
 			c.logger.Warnf("Failed to hex-decode 'coap_if_match' metadata value '%s': %v", ifMatchStr, err)
@@ -442,7 +459,10 @@ func (c *Converter) addOptionsFromMetadata(coapMsg *message.Message, msg *servic
 	// If-None-Match
 	if _, exists := msg.MetaGet("coap_if_none_match"); exists {
 		// The presence of the key indicates the option should be set. It's a zero-byte option.
-		if err := coapMsg.SetOptionBytes(message.IfNoneMatch, []byte{}); err != nil {
+		var err error
+		ifNoneMatchBuf := make([]byte, 256)
+		coapMsg.Options, _, err = coapMsg.Options.SetBytes(ifNoneMatchBuf, message.IfNoneMatch, []byte{})
+		if err != nil {
 			c.logger.Warnf("Failed to set CoAP If-None-Match option from metadata: %v", err)
 		}
 	}
@@ -459,7 +479,7 @@ func (c *Converter) addOptionsFromMetadata(coapMsg *message.Message, msg *servic
 		}
 		var optionsToRestore []preservedOption
 
-		msg.MetaWalk(func(k string, v any) error {
+		msg.MetaWalk(func(k string, v string) error {
 			if strings.HasPrefix(k, "coap_option_") {
 				var optID uint16
 				var optIndex int
@@ -481,12 +501,7 @@ func (c *Converter) addOptionsFromMetadata(coapMsg *message.Message, msg *servic
 						return nil
 					}
 
-					valStr, ok := v.(string)
-					if !ok {
-						c.logger.Warnf("Metadata value for key %s is not a string, skipping", k)
-						return nil
-					}
-					decodedVal, decodeErr := hex.DecodeString(valStr)
+					decodedVal, decodeErr := hex.DecodeString(v)
 					if decodeErr != nil {
 						c.logger.Warnf("Failed to hex-decode metadata value for key %s: %v", k, decodeErr)
 						return nil
@@ -510,7 +525,10 @@ func (c *Converter) addOptionsFromMetadata(coapMsg *message.Message, msg *servic
 		})
 
 		for _, opt := range optionsToRestore {
-			if err := coapMsg.AddOptionBytes(opt.ID, opt.Value); err != nil {
+			var err error
+			restoreBuf := make([]byte, 256)
+			coapMsg.Options, _, err = coapMsg.Options.AddBytes(restoreBuf, opt.ID, opt.Value)
+			if err != nil {
 				c.logger.Warnf("Failed to restore CoAP option ID %d (Index %d) from metadata: %v", opt.ID, opt.Index, err)
 			} else {
 				c.logger.Debugf("Restored generic CoAP option ID %d (Index %d) from metadata", opt.ID, opt.Index)
@@ -539,7 +557,6 @@ func (c *Converter) preserveAllOptions(msg *service.Message, coapMsg *message.Me
 			// So, we skip them from generic preservation.
 			continue
 		}
-
 
 		baseKey := fmt.Sprintf("coap_option_%d", opt.ID)
 		occurrence := optionCounts[opt.ID]

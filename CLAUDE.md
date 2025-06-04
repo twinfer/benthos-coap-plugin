@@ -91,3 +91,5 @@ The plugin handles sensitive IoT communications with built-in security:
 - **Grafana dashboards**: Pre-configured dashboards in `monitoring/grafana/`
 - **Health checks**: Built-in health endpoints for service monitoring
 - **Alerting**: Prometheus alert rules for common failure scenarios
+
+ use Knowledge Graph to save API signuture for future refrence

@@ -291,3 +291,9 @@ func (c *ConnectionWrapper) Endpoint() string {
 func (c *ConnectionWrapper) Connection() interface{} {
 	return c.conn
 }
+
+func (c *ConnectionWrapper) Protocol() string {
+	// This should be set when the connection is created
+	// For now, we'll return a default value
+	return "unknown"
+}

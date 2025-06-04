@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/plgd-dev/go-coap/v3/message"
-	"github.com/plgd-dev/go-coap/v3/mux"
+	"github.com/plgd-dev/go-coap/v3/message/pool"
+	udpClient "github.com/plgd-dev/go-coap/v3/udp/client"
+	tcpClient "github.com/plgd-dev/go-coap/v3/tcp/client"
 	"github.com/redpanda-data/benthos/v4/public/service"
 
 	"github.com/twinfer/benthos-coap-plugin/pkg/connection"
@@ -30,6 +32,7 @@ type Manager struct {
 	cancel        context.CancelFunc
 	mu            sync.RWMutex
 	wg            sync.WaitGroup
+	closed        int32 // atomic flag to prevent double-close
 }
 
 type Config struct {
@@ -50,16 +53,16 @@ type RetryPolicy struct {
 }
 
 type Subscription struct {
-	path         string
-	conn         *connection.ConnectionWrapper
-	observeToken message.Token
-	retryCount   int32
-	lastSeen     time.Time
-	circuit      *CircuitBreaker
-	cancel       context.CancelFunc
-	healthy      int32
-	mu           sync.RWMutex
-	coapObservation interface{} // Stores *client.Observation or *tcpClient.Observation
+	path            string
+	conn            *connection.ConnectionWrapper
+	observeToken    message.Token
+	retryCount      int32
+	lastSeen        time.Time
+	circuit         *CircuitBreaker
+	cancel          context.CancelFunc
+	healthy         int32
+	mu              sync.RWMutex
+	coapObservation interface{} // Stores client.Observation from the observe call
 }
 
 type Metrics struct {
@@ -74,10 +77,25 @@ type Metrics struct {
 func NewManager(config Config, connManager *connection.Manager, converter *converter.Converter, logger *service.Logger, metrics *service.Resources) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Validate configuration
 	bufferSize := config.BufferSize
-	if bufferSize == 0 {
-		logger.Debug("Using default buffer size for observer manager as config.BufferSize is 0")
-		bufferSize = 1000
+	if bufferSize <= 0 {
+		cancel() // Prevent context leak
+		return nil, fmt.Errorf("buffer size must be positive, got: %d", bufferSize)
+	}
+
+	// Validate observe paths
+	for _, path := range config.ObservePaths {
+		if path == "" {
+			cancel() // Prevent context leak
+			return nil, fmt.Errorf("observe path cannot be empty")
+		}
+	}
+
+	// Validate retry policy
+	if config.RetryPolicy.Multiplier > 0 && config.RetryPolicy.Multiplier < 1.0 {
+		cancel() // Prevent context leak
+		return nil, fmt.Errorf("retry multiplier must be >= 1.0, got: %f", config.RetryPolicy.Multiplier)
 	}
 
 	m := &Manager{
@@ -216,40 +234,53 @@ func (m *Manager) performObserve(ctx context.Context, sub *Subscription) error {
 	m.metrics.ObservationsTotal.Incr(1)
 
 	var obsErr error
-	var obsToken message.Token // To store the token of the observation request
 
-	notificationHandler := func(notification *message.Message) {
-		// Since handleObserveMessage expects mux.Message, and *message.Message implements it,
-		// we can pass it directly.
-		m.handleObserveMessage(sub.path, notification)
+	notificationHandler := func(notification *pool.Message) {
+		// Convert pool.Message to message.Message for the converter
+		// The converter expects *message.Message
+		msg := &message.Message{
+			Code:    notification.Code(),
+			Token:   notification.Token(),
+			Options: notification.Options(),
+		}
+		
+		// Copy payload from body
+		if body := notification.Body(); body != nil {
+			payload, err := io.ReadAll(body)
+			if err == nil {
+				msg.Payload = payload
+			}
+			body.Seek(0, 0) // Reset for any future reads
+		}
+		
+		m.handleObserveMessage(sub.path, msg)
 	}
 
 	rawConn := sub.conn.Connection()
 	protocol := sub.conn.Protocol()
 
 	switch conn := rawConn.(type) {
-	case *client.Conn: // Handles UDP and DTLS
-		obsToken, obsErr = conn.Observe(observeCtx, sub.path, notificationHandler)
+	case *udpClient.Conn: // Handles UDP and DTLS
+		observation, obsErr := conn.Observe(observeCtx, sub.path, notificationHandler)
 		if obsErr == nil {
-			// client.Conn.Observe does not directly return a cancel function or observation object to store
-			// The observation is cancelled when observeCtx is cancelled.
-			// We store the token for logging/debugging purposes.
 			sub.mu.Lock()
-			sub.observeToken = obsToken
-			// No specific observation object for client.Conn, cancellation is via context.
-			sub.coapObservation = nil
+			if tokenProvider, ok := observation.(interface{ Token() message.Token }); ok {
+				sub.observeToken = tokenProvider.Token()
+			}
+			sub.coapObservation = observation
 			sub.mu.Unlock()
-			m.logger.Infof("Observation started for path %s on %s (UDP/DTLS) with token %s", sub.path, sub.conn.Endpoint(), obsToken)
+			m.logger.Infof("Observation started for path %s on %s (UDP/DTLS)", sub.path, sub.conn.Endpoint())
 		}
-	case *coapTCPClient.Conn: // Handles TCP and TCP-TLS
-		var observation *coapTCPClient.Observation
-		observation, obsErr = conn.Observe(observeCtx, sub.path, notificationHandler)
+	case *tcpClient.Conn: // Handles TCP and TCP-TLS
+		observation, obsErr := conn.Observe(observeCtx, sub.path, notificationHandler)
 		if obsErr == nil {
 			sub.mu.Lock()
-			sub.observeToken = observation.Token() // TCP observation object has Token()
-			sub.coapObservation = observation      // Store the TCP observation object for potential cancellation
+			if tokenProvider, ok := observation.(interface{ Token() message.Token }); ok {
+				sub.observeToken = tokenProvider.Token()
+			}
+			sub.coapObservation = observation
 			sub.mu.Unlock()
-			m.logger.Infof("Observation started for path %s on %s (TCP/TLS) with token %s", sub.path, sub.conn.Endpoint(), observation.Token())
+			m.logger.Infof("Observation started for path %s on %s (TCP/TLS)", sub.path, sub.conn.Endpoint())
 		}
 	default:
 		obsErr = fmt.Errorf("unsupported connection type for observe: %T (protocol: %s)", rawConn, protocol)
@@ -273,14 +304,15 @@ func (m *Manager) performObserve(ctx context.Context, sub *Subscription) error {
 	obsObj := sub.coapObservation
 	sub.mu.Unlock()
 
-	if tcpObs, ok := obsObj.(*coapTCPClient.Observation); ok && tcpObs != nil {
-		// Attempt to cancel the observation explicitly if it's a TCP observation
-		// For UDP, context cancellation is the primary mechanism.
-		cancelErr := tcpObs.Cancel(context.Background()) // Use a new context for cancellation
-		if cancelErr != nil {
-			m.logger.Warnf("Error cancelling TCP observation for path %s on %s: %v", sub.path, sub.conn.Endpoint(), cancelErr)
-		} else {
-			m.logger.Infof("TCP observation cancelled for path %s on %s", sub.path, sub.conn.Endpoint())
+	// Cancel the observation if it provides a Cancel method
+	if obsObj != nil {
+		if cancellable, ok := obsObj.(interface{ Cancel(context.Context) error }); ok {
+			cancelErr := cancellable.Cancel(context.Background())
+			if cancelErr != nil {
+				m.logger.Warnf("Error cancelling observation for path %s on %s: %v", sub.path, sub.conn.Endpoint(), cancelErr)
+			} else {
+				m.logger.Infof("Observation cancelled for path %s on %s", sub.path, sub.conn.Endpoint())
+			}
 		}
 	}
 
@@ -295,13 +327,19 @@ func (m *Manager) performObserve(ctx context.Context, sub *Subscription) error {
 
 // handleObserveMessage is called when a CoAP notification is received.
 // The coapMsg here is expected to be *message.Message from go-coap/v3 library.
-func (m *Manager) handleObserveMessage(path string, coapMsg mux.Message) {
+func (m *Manager) handleObserveMessage(path string, coapMsg *message.Message) {
 	sub := m.getSubscription(path)
 	if sub == nil {
-		m.logger.Warnf("Received message for unknown or removed subscription path: %s. Token: %s", path, coapMsg.Token())
+		m.logger.Warnf("Received message for unknown or removed subscription path: %s. Token: %s", path, string(coapMsg.Token))
 		return
 	}
-	endpoint := sub.conn.Endpoint()
+	
+	var endpoint string
+	if sub.conn != nil {
+		endpoint = sub.conn.Endpoint()
+	} else {
+		endpoint = "unknown"
+	}
 
 	sub.lastSeen = time.Now()
 	m.metrics.MessagesReceived.Incr(1)
@@ -309,6 +347,11 @@ func (m *Manager) handleObserveMessage(path string, coapMsg mux.Message) {
 	sub.circuit.RecordSuccess()
 
 	// Convert CoAP message to Benthos message using the converter
+	if m.converter == nil {
+		m.logger.Errorf("Converter is nil, cannot convert CoAP message for path %s on %s", path, endpoint)
+		return
+	}
+	
 	benthosMsg, err := m.converter.CoAPToMessage(coapMsg)
 	if err != nil {
 		m.logger.Errorf("Failed to convert CoAP message to Benthos message for path %s on %s: %v", path, endpoint, err)
@@ -327,9 +370,9 @@ func (m *Manager) handleObserveMessage(path string, coapMsg mux.Message) {
 
 	select {
 	case m.msgChan <- benthosMsg:
-		m.logger.Debugf("Successfully queued message from path %s on %s. Token: %s", path, endpoint, coapMsg.Token())
+		m.logger.Debugf("Successfully queued message from path %s on %s. Token: %s", path, endpoint, string(coapMsg.Token))
 	default:
-		m.logger.Warnf("Message channel full for observer manager, dropping message from path %s on %s. Token: %s", path, endpoint, coapMsg.Token())
+		m.logger.Warnf("Message channel full for observer manager, dropping message from path %s on %s. Token: %s", path, endpoint, string(coapMsg.Token))
 	}
 }
 
@@ -350,6 +393,12 @@ func (m *Manager) MessageChan() <-chan *service.Message {
 }
 
 func (m *Manager) Close() error {
+	// Use atomic compare-and-swap to ensure Close is only executed once
+	if !atomic.CompareAndSwapInt32(&m.closed, 0, 1) {
+		m.logger.Debug("Observer manager already closed, skipping")
+		return nil
+	}
+
 	m.logger.Info("Closing observer manager...")
 	m.cancel() // Signal all observeWithRetry goroutines to stop
 
@@ -366,13 +415,15 @@ func (m *Manager) Close() error {
 		obsObj := sub.coapObservation
 		sub.mu.RUnlock()
 
-		if tcpObs, ok := obsObj.(*coapTCPClient.Observation); ok && tcpObs != nil {
-			// Attempt to cancel the observation explicitly if it's a TCP observation
-			cancelErr := tcpObs.Cancel(context.Background()) // Use a new context for cancellation
-			if cancelErr != nil {
-				m.logger.Warnf("Error cancelling TCP observation during manager close for path %s on %s: %v", path, endpoint, cancelErr)
-			} else {
-				m.logger.Debugf("TCP observation cancelled during manager close for path %s on %s", path, endpoint)
+		// Cancel the observation if it provides a Cancel method
+		if obsObj != nil {
+			if cancellable, ok := obsObj.(interface{ Cancel(context.Context) error }); ok {
+				cancelErr := cancellable.Cancel(context.Background())
+				if cancelErr != nil {
+					m.logger.Warnf("Error cancelling observation during manager close for path %s on %s: %v", path, endpoint, cancelErr)
+				} else {
+					m.logger.Debugf("Observation cancelled during manager close for path %s on %s", path, endpoint)
+				}
 			}
 		}
 		m.logger.Debugf("Cancelled subscription and any active CoAP observation for path %s on endpoint %s", path, endpoint)

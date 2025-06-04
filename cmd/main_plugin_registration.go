@@ -8,7 +8,7 @@ import (
 	"github.com/redpanda-data/benthos/v4/public/service"
 
 	// Import Benthos core components
-	_ "github.com/redpanda-data/connect/public/bundle/free/v4"
+	// _ "github.com/redpanda-data/connect/public/bundle/free/v4"
 
 	// Import our CoAP plugin components
 	_ "github.com/twinfer/benthos-coap-plugin/pkg/input"
