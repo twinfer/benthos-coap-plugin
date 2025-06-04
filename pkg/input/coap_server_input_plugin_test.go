@@ -8,11 +8,99 @@ import (
 
 	"github.com/plgd-dev/go-coap/v3/message/codes"
 	"github.com/redpanda-data/benthos/v4/public/service"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"fmt"
+	"math/big"
+	"net"
+	"path/filepath"
+	"crypto/tls"
+
+	"github.com/plgd-dev/go-coap/v3/message"
+	"github.com/plgd-dev/go-coap/v3/options" // Added for client TLS options
+	"github.com/plgd-dev/go-coap/v3/tcp"
+	"github.com/plgd-dev/go-coap/v3/udp"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/twinfer/benthos-coap-plugin/pkg/converter"
 )
+
+// Helper function to get a free port
+func getFreePort() (int, error) {
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	if err != nil {
+		return 0, err
+	}
+	l, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+// generateSelfSignedCert generates a self-signed certificate and key for testing.
+// It stores them in a temporary directory.
+func generateSelfSignedCert(t *testing.T) (certPath, keyPath string, cleanup func()) {
+	t.Helper()
+	tempDir, err := os.MkdirTemp("", "coap_certs")
+	require.NoError(t, err)
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	notBefore := time.Now()
+	notAfter := notBefore.Add(365 * 24 * time.Hour) // Valid for 1 year
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	require.NoError(t, err)
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"Acme Co"},
+		},
+		NotBefore: notBefore,
+		NotAfter:  notAfter,
+
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true, // Self-signed
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	require.NoError(t, err)
+
+	certPath = filepath.Join(tempDir, "cert.pem")
+	keyPath = filepath.Join(tempDir, "key.pem")
+
+	certOut, err := os.Create(certPath)
+	require.NoError(t, err)
+	defer certOut.Close()
+	err = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	require.NoError(t, err)
+
+	keyOut, err := os.Create(keyPath)
+	require.NoError(t, err)
+	defer keyOut.Close()
+	err = pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+	require.NoError(t, err)
+
+	return certPath, keyPath, func() {
+		os.RemoveAll(tempDir)
+	}
+}
+
 
 // TestServerConfigValidation tests server configuration validation
 func TestServerConfigValidation(t *testing.T) {
@@ -490,4 +578,291 @@ func TestConfigParsing(t *testing.T) {
 		assert.Equal(t, codes.Content, config.DefaultCode)
 		assert.Equal(t, "OK", config.DefaultPayload)
 	})
+}
+
+func TestCoAPServerInput_TCPCommunication(t *testing.T) {
+	port, err := getFreePort()
+	require.NoError(t, err)
+	listenAddr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	conf := service.NewConfigSpec().
+		Field(service.NewStringField("listen_address")).
+		Field(service.NewStringField("protocol")).
+		Field(service.NewStringListField("allowed_paths").Default([]string{})).
+		Field(service.NewStringListField("allowed_methods").Default([]string{})).
+		Field(service.NewIntField("buffer_size")).
+		Field(service.NewDurationField("timeout")).
+		Field(service.NewObjectField("response",
+			service.NewStringField("default_content_format").Default("text/plain"),
+			service.NewIntField("default_code").Default(int(codes.Content)),
+			service.NewStringField("default_payload"),
+		)).
+		Field(service.NewObjectField("security",
+			service.NewStringField("mode").Default("none"),
+			service.NewStringField("psk_identity").Optional(),
+			service.NewStringField("psk_key").Optional(),
+			service.NewStringField("cert_file").Optional(),
+			service.NewStringField("key_file").Optional(),
+			service.NewStringField("ca_cert_file").Optional(),
+			service.NewBoolField("require_client_cert").Default(false),
+		)).
+		Field(service.NewObjectField("converter",
+			service.NewStringField("default_content_format").Default("application/json"),
+			service.NewBoolField("compression_enabled").Default(true),
+			service.NewIntField("max_payload_size").Default(1048576),
+			service.NewBoolField("preserve_options").Default(true),
+		))
+
+	parsedConf, err := conf.ParseYAML(fmt.Sprintf(`
+listen_address: %s
+protocol: tcp
+buffer_size: 10
+timeout: 5s
+allowed_paths: ["/test/tcp"] # Reverted to /test/tcp
+allowed_methods: ["GET"]
+response:
+  default_payload: "TCP OK"
+`, listenAddr), nil)
+	require.NoError(t, err)
+
+	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	_ = logger // Prevent unused variable if not used directly by MockResources
+	mgr := service.MockResources() // Simpler MockResources, will use default logger
+
+	input, err := newCoAPServerInput(parsedConf, mgr)
+	require.NoError(t, err)
+	require.NotNil(t, input)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	// Allow server to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Client
+	co, err := tcp.Dial(listenAddr)
+	require.NoError(t, err)
+	defer co.Close()
+
+	// Send GET request
+	resp, err := co.Get(ctx, "/test/tcp") // Reverted path to /test/tcp
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	assert.Equal(t, codes.Content, resp.Code())
+	payload, err := resp.ReadBody()
+	require.NoError(t, err)
+	assert.Equal(t, "TCP OK", string(payload))
+
+	// Check if message was received by Benthos input
+	benthosMsg, _, err := input.Read(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, benthosMsg)
+
+	meta, ok := benthosMsg.MetaGet("coap_server_path")
+	require.True(t, ok)
+	assert.Equal(t, "/test/tcp", meta) // Expected path is now /test/tcp
+
+	metaMethod, ok := benthosMsg.MetaGet("coap_server_method")
+	require.NoError(t, err)
+	assert.Equal(t, "GET", metaMethod)
+}
+
+
+func TestCoAPServerInput_TCPSecureCommunication(t *testing.T) {
+	port, err := getFreePort()
+	require.NoError(t, err)
+	listenAddr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	certFile, keyFile, certCleanup := generateSelfSignedCert(t)
+	defer certCleanup()
+
+	// Use comprehensive config spec
+	conf := service.NewConfigSpec().
+		Field(service.NewStringField("listen_address")).
+		Field(service.NewStringField("protocol")).
+		Field(service.NewStringListField("allowed_paths").Default([]string{})).
+		Field(service.NewStringListField("allowed_methods").Default([]string{})).
+		Field(service.NewIntField("buffer_size")).
+		Field(service.NewDurationField("timeout")).
+		Field(service.NewObjectField("response",
+			service.NewStringField("default_content_format").Default("text/plain"),
+			service.NewIntField("default_code").Default(int(codes.Content)),
+			service.NewStringField("default_payload"),
+		)).
+		Field(service.NewObjectField("security",
+			service.NewStringField("mode").Default("none"),
+			service.NewStringField("psk_identity").Optional(),
+			service.NewStringField("psk_key").Optional(),
+			service.NewStringField("cert_file").Optional(), // Will be overridden by YAML
+			service.NewStringField("key_file").Optional(),   // Will be overridden by YAML
+			service.NewStringField("ca_cert_file").Optional(),
+			service.NewBoolField("require_client_cert").Default(false),
+		)).
+		Field(service.NewObjectField("converter",
+			service.NewStringField("default_content_format").Default("application/json"),
+			service.NewBoolField("compression_enabled").Default(true),
+			service.NewIntField("max_payload_size").Default(1048576),
+			service.NewBoolField("preserve_options").Default(true),
+		))
+
+	parsedConf, err := conf.ParseYAML(fmt.Sprintf(`
+listen_address: %s
+protocol: tcp-tls
+buffer_size: 10
+timeout: 5s
+security:
+  mode: certificate
+  cert_file: %s
+  key_file: %s
+  ca_cert_file: "" # Explicitly provide empty ca_cert_file
+allowed_paths: ["/test/tcp-tls"]
+allowed_methods: ["GET"]
+response:
+  default_payload: "TCP-TLS OK"
+`, listenAddr, certFile, keyFile), nil)
+	require.NoError(t, err)
+
+	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	_ = logger // Prevent unused variable
+	mgr := service.MockResources() // Simpler MockResources
+
+	input, err := newCoAPServerInput(parsedConf, mgr)
+	require.NoError(t, err)
+	require.NotNil(t, input)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	// Allow server to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Client
+	// Client
+	clientTLSConfig := &tls.Config{
+		RootCAs: x509.NewCertPool(), // Create an empty pool
+		// InsecureSkipVerify: true, // Alternative if not loading CA
+	}
+	// Load server cert as CA for the client for testing
+	serverCertPEM, err := os.ReadFile(certFile)
+	require.NoError(t, err)
+	ok := clientTLSConfig.RootCAs.AppendCertsFromPEM(serverCertPEM)
+	require.True(t, ok)
+
+	co, err := tcp.Dial(listenAddr, options.WithTLS(clientTLSConfig)) // Changed WithTLSConfig to WithTLS
+	require.NoError(t, err)
+	defer co.Close()
+
+	// Send GET request
+	resp, err := co.Get(ctx, "/test/tcp-tls")
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	assert.Equal(t, codes.Content, resp.Code())
+	payload, err := resp.ReadBody()
+	require.NoError(t, err)
+	assert.Equal(t, "TCP-TLS OK", string(payload))
+
+	// Check if message was received by Benthos input
+	benthosMsg, _, err := input.Read(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, benthosMsg)
+
+	meta, ok := benthosMsg.MetaGet("coap_server_path")
+	require.True(t, ok)
+	assert.Equal(t, "/test/tcp-tls", meta)
+}
+
+// TestCoAPServerInput_UDPCommunication (Example of how an existing UDP test might look)
+// This is a placeholder to show that other tests would remain.
+func TestCoAPServerInput_UDPCommunication(t *testing.T) {
+	port, err := getFreePort()
+	require.NoError(t, err)
+	listenAddr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	// Use comprehensive config spec
+	conf := service.NewConfigSpec().
+		Field(service.NewStringField("listen_address")).
+		Field(service.NewStringField("protocol")).
+		Field(service.NewStringListField("allowed_paths").Default([]string{})).
+		Field(service.NewStringListField("allowed_methods").Default([]string{})).
+		Field(service.NewIntField("buffer_size")).
+		Field(service.NewDurationField("timeout")).
+		Field(service.NewObjectField("response",
+			service.NewStringField("default_content_format").Default("text/plain"),
+			service.NewIntField("default_code").Default(int(codes.Content)),
+			service.NewStringField("default_payload"),
+		)).
+		Field(service.NewObjectField("security",
+			service.NewStringField("mode").Default("none"),
+			service.NewStringField("psk_identity").Optional(),
+			service.NewStringField("psk_key").Optional(),
+			service.NewStringField("cert_file").Optional(),
+			service.NewStringField("key_file").Optional(),
+			service.NewStringField("ca_cert_file").Optional(),
+			service.NewBoolField("require_client_cert").Default(false),
+		)).
+		Field(service.NewObjectField("converter",
+			service.NewStringField("default_content_format").Default("application/json"),
+			service.NewBoolField("compression_enabled").Default(true),
+			service.NewIntField("max_payload_size").Default(1048576),
+			service.NewBoolField("preserve_options").Default(true),
+		))
+
+	parsedConf, err := conf.ParseYAML(fmt.Sprintf(`
+listen_address: %s
+protocol: udp
+buffer_size: 10
+timeout: 5s
+allowed_paths: ["/test/udp"]
+allowed_methods: ["GET"]
+response:
+  default_payload: "UDP OK"
+`, listenAddr), nil)
+	require.NoError(t, err)
+
+	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	_ = logger // Prevent unused variable
+	mgr := service.MockResources() // Simpler MockResources
+
+	input, err := newCoAPServerInput(parsedConf, mgr)
+	require.NoError(t, err)
+	require.NotNil(t, input)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond) // Allow server to start
+
+	co, err := udp.Dial(listenAddr)
+	require.NoError(t, err)
+	defer co.Close()
+
+	resp, err := co.Get(ctx, "/test/udp", message.Option{ID: message.URIPath, Value: []byte("test/udp")})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	assert.Equal(t, codes.Content, resp.Code())
+	payload, err := resp.ReadBody()
+	require.NoError(t, err)
+	assert.Equal(t, "UDP OK", string(payload))
+
+	benthosMsg, _, err := input.Read(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, benthosMsg)
+	metaPath, ok := benthosMsg.MetaGet("coap_server_path")
+	require.True(t, ok)
+	assert.Equal(t, "/test/udp", metaPath)
 }
