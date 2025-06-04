@@ -19,14 +19,31 @@ input:
             - "/sensors/pressure"
             - "/status/health"
           
-          protocol: "udp"
+          protocol: "udp" # Default: "udp"
           
-          connection:
-            pool_size: 5
-            health_check_interval: "30s"
-            max_idle_time: "5m"
+          # Optional: Security settings (defaults to "none")
+          # security:
+            # mode: "none"
+            # psk_identity: "client_id"
+            # psk_key: "secret_key"
+            # cert_file: "client.crt"
+            # key_file: "client.key"
+            # ca_cert_file: "ca.crt"
+            # insecure_skip_verify: false
+
+          connection_pool: # Renamed from "connection"
+            max_size: 5 # Renamed from "pool_size", Default: 5
+            idle_timeout: "5m" # Renamed from "max_idle_time", Default: "30s"
+            health_check_interval: "30s" # Default: "10s"
+            connect_timeout: "10s" # Default
           
-          retry_policy:
+          # Optional: Observer settings (using defaults here)
+          # observer:
+            # buffer_size: 1000
+            # observe_timeout: "5m"
+            # resubscribe_delay: "5s"
+
+          retry_policy: # For initial connection/subscription attempts
             max_retries: 3
             initial_interval: "1s"
             max_interval: "30s"
@@ -41,8 +58,10 @@ input:
             half_open_max_calls: 2
           
           converter:
-            default_content_format: "application/json"
-            preserve_options: true
+            default_content_format: "application/json" # Default
+            # compression_enabled: true # Default
+            # max_payload_size: 1048576 # Default (1MB)
+            preserve_options: true # Overrides default (false for input.coap client)
       
       # Server-side input: Act as a CoAP server for external clients
       - coap_server:
@@ -69,8 +88,26 @@ input:
             default_code: 69  # Content (2.05)
             default_payload: '{"status": "accepted"}'
           
+          # Optional: Security settings (defaults to "none")
+          # security:
+            # mode: "none"
+            # psk_identity: "server_id"
+            # psk_key: "server_secret_key"
+            # cert_file: "server.crt"
+            # key_file: "server.key"
+            # ca_cert_file: "ca.crt"
+            # require_client_cert: false
+
           converter:
-            preserve_options: true
+            # default_content_format: "application/json" # Default for coap_server converter
+            # compression_enabled: true # Default
+            # max_payload_size: 1048576 # Default (1MB)
+            preserve_options: true # Default for coap_server converter
+
+          # Optional: Observe server settings (defaults to disabled)
+          # observe_server:
+            # enable_observe_server: false
+            # default_notification_max_age: "60s"
 
 # Advanced processing pipeline
 pipeline:

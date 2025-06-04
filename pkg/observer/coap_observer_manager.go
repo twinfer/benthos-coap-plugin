@@ -358,6 +358,10 @@ func (m *Manager) handleObserveMessage(path string, coapMsg *message.Message) {
 		return
 	}
 
+	// Add the original observe path as metadata since CoAP notifications
+	// don't include URI-Path options in the response
+	benthosMsg.MetaSet("coap_uri_path", path)
+	
 	// Add extra metadata not handled by the generic converter, if any.
 	// The converter should ideally handle Token, Observe option, etc.
 	// For now, let's assume converter.CoAPToMessage populates essential fields.

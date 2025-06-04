@@ -302,6 +302,11 @@ func (o *Output) WriteWithRetry(ctx context.Context, msg *service.Message, retry
 		msg.MetaSet("coap_path", path) // Set for clarity and potential re-conversion
 	}
 
+	// Set content format from config if not already set in metadata
+	if _, exists := msg.MetaGet("content_type"); !exists && o.config.RequestOptions.ContentFormat != "" {
+		msg.MetaSet("content_type", o.config.RequestOptions.ContentFormat)
+	}
+	
 	// Convert Benthos message to CoAP message
 	coapMsg, err := o.converter.MessageToCoAP(msg) // converter now uses coap_path from metadata
 	if err != nil {
@@ -418,17 +423,23 @@ func (o *Output) sendUDPMessage(ctx context.Context, conn *udpClient.Conn, origi
 	// Set payload using SetBody instead of SetPayload
 	req.SetBody(bytes.NewReader(coapMsg.Payload))
 
-	// Copy content format if set
+	// Copy all options from the converted message
 	if len(coapMsg.Options) > 0 {
-		// Try to extract content format from options
 		for _, opt := range coapMsg.Options {
-			if opt.ID == message.ContentFormat && len(opt.Value) > 0 {
-				// Convert bytes to uint32 for content format
-				if len(opt.Value) >= 1 {
-					cf := message.MediaType(opt.Value[0])
-					req.SetContentFormat(cf)
+			if opt.ID == message.ContentFormat {
+				// Use proper method to decode and set content format
+				if len(opt.Value) == 0 {
+					// Content format 0 (TextPlain) might be encoded as empty
+					req.SetContentFormat(message.TextPlain)
+				} else {
+					// Decode the content format properly
+					cf, _, err := message.DecodeUint32(opt.Value)
+					if err == nil {
+						req.SetContentFormat(message.MediaType(cf))
+					}
 				}
 			}
+			// Other options like URIPath are handled by SetPath, so we skip them
 		}
 	}
 

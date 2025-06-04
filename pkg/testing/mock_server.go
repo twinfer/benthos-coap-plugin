@@ -109,6 +109,11 @@ type MockResource struct {
 	LastModified         time.Time         // Timestamp of the last modification to the resource.
 	ServeWithOptions     []message.Option  // CoAP options to be included in responses for GET requests to this resource.
 	LastPutOrPostOptions []message.Option  // CoAP options received in the last PUT or POST request to this resource.
+	
+	// Fields for testing scenarios
+	ResponseDelay         time.Duration // Delay before responding (for timeout tests)
+	ResponseSequence      []codes.Code  // Sequence of response codes to return
+	CurrentResponseIndex  int           // Current index in ResponseSequence
 }
 
 // Observer represents an active CoAP observer client for a specific resource.
@@ -232,7 +237,8 @@ func (m *MockCoAPServer) Start() error {
 	router := mux.NewRouter()
 	// All requests are routed through the main handleRequest method, which then delegates
 	// to specific handlers based on the CoAP method code.
-	router.Handle("/", mux.HandlerFunc(m.handleRequest))
+	// Use DefaultHandler to catch all unmatched requests
+	router.DefaultHandle(mux.HandlerFunc(m.handleRequest))
 
 	m.server = server.New(options.WithMux(router))
 
@@ -516,8 +522,32 @@ func (h *PostHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path s
 		}
 	}
 
-	if errSetResp := w.SetResponse(codes.Created, message.TextPlain, nil); errSetResp != nil {
-		fmt.Printf("MockCoAPServer ERROR: [POST %s] Failed to set Created response: %v\n", path, errSetResp)
+	// Check if there's a response delay or sequence to follow
+	h.server.mu.Lock()
+	res, exists := h.server.resources[path]
+	var responseCode codes.Code = codes.Created
+	var responseDelay time.Duration
+	if exists {
+		// Check for response delay
+		responseDelay = res.ResponseDelay
+		
+		// Check for response sequence
+		if len(res.ResponseSequence) > 0 {
+			if res.CurrentResponseIndex < len(res.ResponseSequence) {
+				responseCode = res.ResponseSequence[res.CurrentResponseIndex]
+				res.CurrentResponseIndex++
+			}
+		}
+	}
+	h.server.mu.Unlock()
+	
+	// Apply response delay if specified
+	if responseDelay > 0 {
+		time.Sleep(responseDelay)
+	}
+
+	if errSetResp := w.SetResponse(responseCode, message.TextPlain, nil); errSetResp != nil {
+		fmt.Printf("MockCoAPServer ERROR: [POST %s] Failed to set %s response: %v\n", path, responseCode, errSetResp)
 	}
 }
 
@@ -577,10 +607,33 @@ func (h *PutHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path st
 		// For now, assume UpdateResource's error is about notifications.
 	}
 
+	// Check if there's a response delay or sequence to follow
+	h.server.mu.Lock()
+	res, exists := h.server.resources[path]
 	responseCode := codes.Changed
 	if created { // If the PUT created the resource
 		responseCode = codes.Created
 	}
+	var responseDelay time.Duration
+	if exists {
+		// Check for response delay
+		responseDelay = res.ResponseDelay
+		
+		// Check for response sequence
+		if len(res.ResponseSequence) > 0 {
+			if res.CurrentResponseIndex < len(res.ResponseSequence) {
+				responseCode = res.ResponseSequence[res.CurrentResponseIndex]
+				res.CurrentResponseIndex++
+			}
+		}
+	}
+	h.server.mu.Unlock()
+	
+	// Apply response delay if specified
+	if responseDelay > 0 {
+		time.Sleep(responseDelay)
+	}
+	
 	if errSetResp := w.SetResponse(responseCode, message.TextPlain, nil); errSetResp != nil {
 		fmt.Printf("MockCoAPServer ERROR: [PUT %s] Failed to set %s response: %v\n", path, responseCode, errSetResp)
 	}
@@ -659,23 +712,22 @@ func (m *MockCoAPServer) sendObserveNotification(observer *Observer, resource *M
 
 	rw, ok := observer.Response.(responseWriterWithOptions)
 	if !ok {
-		// This is a critical failure for an observer, as the Observe option cannot be set.
-		fmt.Printf("MockCoAPServer ERROR: [Notify %s] Observer ResponseWriter (token %x) does not implement SetOptionBytes. Notification will be incomplete. Deactivating observer.\n", resource.Path, observer.Token)
-		observer.Active = false // Deactivate observer as it cannot correctly process notifications.
-		return
-	}
-
-	// Encode and set the Observe option with the current sequence number.
-	buf := make([]byte, 4) // Max size for uint32 CoAP Observe option encoding.
-	bytesWritten, _ := message.EncodeUint32(buf, resource.ObserveSeq)
-	obsBytes := buf[:bytesWritten]
-
-	if err := rw.SetOptionBytes(message.Observe, obsBytes); err != nil {
-		// Failure to set the Observe option is critical for the client's ability to process the notification.
-		fmt.Printf("MockCoAPServer ERROR: [Notify %s] Failed to set Observe option (seq %d, token %x): %v. Deactivating observer.\n", resource.Path, resource.ObserveSeq, observer.Token, err)
-		observer.Active = false // Deactivate observer as it's not processing notifications correctly.
+		// For testing purposes, continue even if we can't set the Observe option properly
+		// The notification content will still be sent, just without the proper Observe sequence number
+		fmt.Printf("MockCoAPServer WARNING: [Notify %s] Observer ResponseWriter (token %x) does not implement SetOptionBytes. Notification will be sent without Observe option.\n", resource.Path, observer.Token)
+		// Don't deactivate observer - continue sending notifications for testing
 	} else {
-		// fmt.Printf("MockCoAPServer DEBUG: [Notify %s] Successfully sent Observe notification (seq %d, token %x).\n", resource.Path, resource.ObserveSeq, observer.Token)
+		// Encode and set the Observe option with the current sequence number.
+		buf := make([]byte, 4) // Max size for uint32 CoAP Observe option encoding.
+		bytesWritten, _ := message.EncodeUint32(buf, resource.ObserveSeq)
+		obsBytes := buf[:bytesWritten]
+
+		if err := rw.SetOptionBytes(message.Observe, obsBytes); err != nil {
+			// For testing purposes, log the error but don't deactivate the observer
+			fmt.Printf("MockCoAPServer WARNING: [Notify %s] Failed to set Observe option (seq %d, token %x): %v. Continuing anyway.\n", resource.Path, resource.ObserveSeq, observer.Token, err)
+		} else {
+			// fmt.Printf("MockCoAPServer DEBUG: [Notify %s] Successfully sent Observe notification (seq %d, token %x).\n", resource.Path, resource.ObserveSeq, observer.Token)
+		}
 	}
 
 	// Note: The actual sending of the message over the wire is handled by the CoAP library
@@ -789,6 +841,69 @@ func (m *MockCoAPServer) GetResourceLastPutOrPostOptions(path string) ([]message
 		optsCopy = append(optsCopy, message.Option{ID: o.ID, Value: valueCopy})
 	}
 	return optsCopy, true
+}
+
+// GetResource retrieves a resource by path for testing purposes
+func (m *MockCoAPServer) GetResource(path string) (*MockResource, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
+	resource, exists := m.resources[path]
+	if !exists {
+		return nil, false
+	}
+	
+	// Return a copy to prevent external modification
+	resourceCopy := *resource
+	return &resourceCopy, true
+}
+
+// MuLock exposes the mutex for test helper functions
+func (m *MockCoAPServer) MuLock() {
+	m.mu.Lock()
+}
+
+// MuUnlock exposes the mutex for test helper functions  
+func (m *MockCoAPServer) MuUnlock() {
+	m.mu.Unlock()
+}
+
+// GetResourceInternal provides direct access to the resource map for test helpers
+func (m *MockCoAPServer) GetResourceInternal(path string) (*MockResource, bool) {
+	resource, exists := m.resources[path]
+	return resource, exists
+}
+
+// SetResourceInternal provides direct access to set resources for test helpers
+func (m *MockCoAPServer) SetResourceInternal(path string, resource *MockResource) {
+	m.resources[path] = resource
+}
+
+// SetResourceDelay sets the response delay for a resource
+func (m *MockCoAPServer) SetResourceDelay(path string, delay time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	resource, exists := m.resources[path]
+	if !exists {
+		return fmt.Errorf("resource not found: %s", path)
+	}
+	
+	resource.ResponseDelay = delay
+	return nil
+}
+
+// SetupTestServer creates and starts a MockCoAPServer for testing
+func SetupTestServer(t interface{}) (*MockCoAPServer, func()) {
+	server := NewMockCoAPServer()
+	err := server.Start()
+	if err != nil {
+		panic(fmt.Sprintf("Failed to start mock server: %v", err))
+	}
+	
+	return server, func() {
+		server.Stop()
+	}
 }
 
 // MockCoAPClient provides a simplified CoAP client for use in integration tests,

@@ -293,46 +293,8 @@ func (s *ServerInput) Connect(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 
-	// Configure router handlers
-	// We need to separate exact paths from wildcard patterns for proper router registration
-	exactPaths := make([]string, 0, len(s.config.AllowedPaths))
-	wildcardPaths := make([]string, 0, len(s.config.AllowedPaths))
-
-	for _, p := range s.config.AllowedPaths {
-		if s.containsWildcards(p) {
-			wildcardPaths = append(wildcardPaths, p)
-		} else {
-			exactPaths = append(exactPaths, p)
-		}
-	}
-
-	// Register exact paths with the router for optimal routing performance
-	// These paths can be handled directly by the router's native path matching
-	if len(exactPaths) > 0 {
-		s.logger.Debugf("Registering %d exact paths with router", len(exactPaths))
-		for _, p := range exactPaths {
-			normalizedPath := p
-			if !strings.HasPrefix(normalizedPath, "/") && normalizedPath != "" {
-				normalizedPath = "/" + normalizedPath
-			} else if normalizedPath == "" { // Treat empty path as root
-				normalizedPath = "/"
-			}
-			s.logger.Debugf("Registering exact path handler: %s", normalizedPath)
-			s.router.HandleFunc(normalizedPath, s.handleRequest)
-		}
-	}
-
-	// Log information about wildcard patterns
-	if len(wildcardPaths) > 0 {
-		s.logger.Infof("Found %d wildcard patterns in allowed_paths: %v", len(wildcardPaths), wildcardPaths)
-		s.logger.Info("Wildcard patterns will be handled by the catch-all handler and filtered in isPathAllowed()")
-	}
-
-	// Always register the catch-all handler for:
-	// 1. Requests to wildcard patterns (filtered by isPathAllowed)
-	// 2. Requests when no specific paths are configured (empty allowed_paths means allow all)
-	// 3. Fallback for any unmatched requests
-	s.router.HandleFunc("/*", s.handleRequest)
+	// Use DefaultHandle to catch all requests and filter them in handleRequest
+	s.router.DefaultHandle(mux.HandlerFunc(s.handleRequest))
 
 	// Note: Each server type (UDP, TCP, DTLS) has its own Option interface
 

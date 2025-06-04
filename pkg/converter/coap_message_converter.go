@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"compress/zlib"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -130,9 +131,19 @@ func (c *Converter) MessageToCoAP(msg *service.Message) (*message.Message, error
 	// Add options from metadata
 	c.addOptionsFromMetadata(coapMsg, msg)
 
-	// Set token from metadata if available
+	// Set token from metadata if available, otherwise generate a random token
 	if tokenStr, exists := msg.MetaGet("coap_token"); exists {
 		coapMsg.Token = message.Token(tokenStr)
+	} else {
+		// Generate a random 4-byte token
+		token := make([]byte, 4)
+		if _, err := rand.Read(token); err != nil {
+			// If random generation fails, use a simple counter-based token
+			// This is a fallback, though crypto/rand should rarely fail
+			c.logger.Warnf("Failed to generate random token, using fallback: %v", err)
+			token = []byte{0x01, 0x02, 0x03, 0x04}
+		}
+		coapMsg.Token = message.Token(token)
 	}
 
 	return coapMsg, nil
@@ -273,7 +284,14 @@ func (c *Converter) determineContentFormat(msg *service.Message) (uint32, error)
 
 	// Check content type metadata
 	if ctStr, exists := msg.MetaGet("content_type"); exists {
-		return c.mimeTypeToContentFormat(ctStr), nil
+		cf := c.mimeTypeToContentFormat(ctStr)
+		return cf, nil
+	}
+
+	// Use default content format from config if specified
+	if c.config.DefaultContentFormat != "" {
+		cf := c.mimeTypeToContentFormat(c.config.DefaultContentFormat)
+		return cf, nil
 	}
 
 	// Try to auto-detect from payload
@@ -282,7 +300,8 @@ func (c *Converter) determineContentFormat(msg *service.Message) (uint32, error)
 		return AppOctets, nil
 	}
 
-	return c.autoDetectContentFormat(payload), nil
+	cf := c.autoDetectContentFormat(payload)
+	return cf, nil
 }
 
 func (c *Converter) autoDetectContentFormat(payload []byte) uint32 {

@@ -8,34 +8,88 @@ import (
 	"testing"
 	"time"
 
-	"github.com/benthosdev/benthos/v4/public/service"
+	"github.com/redpanda-data/benthos/v4/public/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/twinfer/benthos-coap-plugin/pkg/testing" // Our mock server package
+	mockserver "github.com/twinfer/benthos-coap-plugin/pkg/testing" // Our mock server package
 
 	coapMessage "github.com/plgd-dev/go-coap/v3/message"
 	"github.com/plgd-dev/go-coap/v3/message/codes"
 )
 
-func newCoapOutputFromConf(t *testing.T, confYaml string) *CoapOutput {
+func newCoapOutputFromConf(t *testing.T, confYaml string) *Output {
 	t.Helper()
-	pConf, err := coapOutputPluginSpec().ParseYAML(confYaml, nil)
+	// Create a temporary config spec since the real one is in init()
+	configSpec := service.NewConfigSpec().
+		Field(service.NewStringListField("endpoints")).
+		Field(service.NewStringField("default_path").Default("/")).
+		Field(service.NewStringField("protocol").Default("udp")).
+		Field(service.NewObjectField("security",
+			service.NewStringField("mode").Default("none"),
+			service.NewStringField("psk_identity").Optional(),
+			service.NewStringField("psk_key").Optional(),
+			service.NewStringField("cert_file").Optional(),
+			service.NewStringField("key_file").Optional(),
+			service.NewStringField("ca_cert_file").Optional(),
+			service.NewBoolField("require_client_cert").Default(false)).Optional()).
+		Field(service.NewObjectField("connection_pool",
+			service.NewIntField("max_size").Default(5),
+			service.NewDurationField("idle_timeout").Default("30s"),
+			service.NewDurationField("health_check_interval").Default("10s"),
+			service.NewDurationField("connect_timeout").Default("10s")).Optional()).
+		Field(service.NewObjectField("request_options",
+			service.NewBoolField("confirmable").Default(true),
+			service.NewStringField("default_method").Default("POST"),
+			service.NewDurationField("timeout").Default("30s"),
+			service.NewStringField("content_format").Default("application/json").Optional(),
+			service.NewBoolField("auto_detect_format").Default(true)).Optional()).
+		Field(service.NewObjectField("retry_policy",
+			service.NewIntField("max_retries").Default(3),
+			service.NewDurationField("initial_interval").Default("1s"),
+			service.NewDurationField("max_interval").Default("60s"),
+			service.NewFloatField("multiplier").Default(2.0),
+			service.NewBoolField("jitter").Default(true)).Optional()).
+		Field(service.NewObjectField("converter",
+			service.NewStringField("default_content_format").Default("application/json"),
+			service.NewBoolField("compression_enabled").Default(true),
+			service.NewIntField("max_payload_size").Default(1048576),
+			service.NewBoolField("preserve_options").Default(false)).Optional())
+	
+	pConf, err := configSpec.ParseYAML(confYaml, nil)
 	require.NoError(t, err)
 
-	output, err := newCoapOutput(pConf, service.MockResources())
+	output, err := newCoAPOutput(pConf, service.MockResources())
 	require.NoError(t, err)
-	return output
+	return output.(*Output)
+}
+
+// setupCoapOutput is a helper that creates an Output and connects it
+func setupCoapOutput(t *testing.T, confYaml string) (*Output, func()) {
+	t.Helper()
+	output := newCoapOutputFromConf(t, confYaml)
+	ctx := context.Background()
+	err := output.Connect(ctx)
+	require.NoError(t, err)
+	return output, func() {
+		output.Close(ctx)
+	}
 }
 
 func TestCoapOutput_Integration_BasicPostDefaultPath(t *testing.T) {
-	mockServer, serverCleanup := testing.SetupTestServer(t)
+	mockServer, serverCleanup := mockserver.SetupTestServer(t)
 	defer serverCleanup()
 
+	// Add a resource at the path we'll be posting to
+	mockServer.AddResource("/default/postpath", coapMessage.TextPlain, []byte("initial data"), false)
+
 	conf := fmt.Sprintf(`
-url: "coap://%s"
+endpoints: ["coap://%s"]
 default_path: "/default/postpath"
-default_method: "POST"
-default_content_format: "text/plain"
+request_options:
+  default_method: "POST"
+  content_format: "text/plain"
+connection_pool:
+  health_check_interval: "24h"
 `, mockServer.Addr())
 
 	output, outputCleanup := setupCoapOutput(t, conf)
@@ -44,7 +98,7 @@ default_content_format: "text/plain"
 	msgContent := "Hello, Benthos to CoAP!"
 	benthosMsg := service.NewMessage([]byte(msgContent))
 
-	err := output.Write(context.Background(), service.MessageBatch{benthosMsg})
+	err := output.WriteBatch(context.Background(), service.MessageBatch{benthosMsg})
 	require.NoError(t, err, "CoapOutput failed to write message")
 
 	history := mockServer.GetRequestHistory()
@@ -60,21 +114,22 @@ default_content_format: "text/plain"
 }
 
 func TestCoapOutput_Integration_PathFromURLAndMetadata(t *testing.T) {
-	mockServer, serverCleanup := testing.SetupTestServer(t)
+	mockServer, serverCleanup := mockserver.SetupTestServer(t)
 	defer serverCleanup()
 
-	// Path in URL
+	// Path in URL - simulate path being extracted from URL by setting it as default_path
 	confURLPath := fmt.Sprintf(`
-url: "coap://%s/url/path"
-default_path: "/default/path" 
-default_method: "POST"
+endpoints: ["coap://%s"]
+default_path: "/url/path"
+request_options:
+  default_method: "POST"
 `, mockServer.Addr())
 
 	outputURL, cleanupURL := setupCoapOutput(t, confURLPath)
 	defer cleanupURL()
 
 	msgContent1 := "Message to URL path"
-	err := outputURL.Write(context.Background(), service.MessageBatch{service.NewMessage([]byte(msgContent1))})
+	err := outputURL.WriteBatch(context.Background(), service.MessageBatch{service.NewMessage([]byte(msgContent1))})
 	require.NoError(t, err)
 
 	history := mockServer.GetRequestHistory()
@@ -85,7 +140,7 @@ default_method: "POST"
 	// Path from metadata (overrides URL path)
 	benthosMsgMeta := service.NewMessage([]byte("Message to metadata path"))
 	benthosMsgMeta.MetaSet("coap_path", "/metadata/path")
-	err = outputURL.Write(context.Background(), service.MessageBatch{benthosMsgMeta})
+	err = outputURL.WriteBatch(context.Background(), service.MessageBatch{benthosMsgMeta})
 	require.NoError(t, err)
 
 	history = mockServer.GetRequestHistory()
@@ -94,31 +149,36 @@ default_method: "POST"
 }
 
 func TestCoapOutput_Integration_DifferentMethods(t *testing.T) {
-	mockServer, serverCleanup := testing.SetupTestServer(t)
+	mockServer, serverCleanup := mockserver.SetupTestServer(t)
 	defer serverCleanup()
 
+	// Add a resource at the path we'll be testing
+	mockServer.AddResource("/test/methods", coapMessage.TextPlain, []byte("test data"), false)
+
 	conf := fmt.Sprintf(`
-url: "coap://%s/test/methods"
-default_method: "GET" # Default to GET for this test block
+endpoints: ["coap://%s"]
+default_path: "/test/methods"
+request_options:
+  default_method: "GET"
 `, mockServer.Addr())
 	output, outputCleanup := setupCoapOutput(t, conf)
 	defer outputCleanup()
 
 	// 1. Default GET (from config)
 	msgGet := service.NewMessage(nil) // No payload for GET
-	err := output.Write(context.Background(), service.MessageBatch{msgGet})
+	err := output.WriteBatch(context.Background(), service.MessageBatch{msgGet})
 	require.NoError(t, err)
 
 	// 2. PUT from metadata
 	msgPut := service.NewMessage([]byte("data for PUT"))
 	msgPut.MetaSet("coap_method", "PUT")
-	err = output.Write(context.Background(), service.MessageBatch{msgPut})
+	err = output.WriteBatch(context.Background(), service.MessageBatch{msgPut})
 	require.NoError(t, err)
 
 	// 3. DELETE from metadata
 	msgDelete := service.NewMessage(nil)
 	msgDelete.MetaSet("coap_method", "DELETE")
-	err = output.Write(context.Background(), service.MessageBatch{msgDelete})
+	err = output.WriteBatch(context.Background(), service.MessageBatch{msgDelete})
 	require.NoError(t, err)
 
 	history := mockServer.GetRequestHistory()
@@ -131,18 +191,21 @@ default_method: "GET" # Default to GET for this test block
 }
 
 func TestCoapOutput_Integration_ConfirmableNonConfirmable(t *testing.T) {
-	mockServer, serverCleanup := testing.SetupTestServer(t)
+	mockServer, serverCleanup := mockserver.SetupTestServer(t)
 	defer serverCleanup()
 
+	// Add a resource at the path we'll be testing
+	mockServer.AddResource("/confirmabletest", coapMessage.TextPlain, []byte("test data"), false)
+
 	baseConf := `
-url: "coap://%s/confirmabletest"
-default_path: "/test"
+endpoints: ["coap://%s"]
+default_path: "/confirmabletest"
 `
 	// Test Confirmable (default)
 	confConfirmable := fmt.Sprintf(baseConf, mockServer.Addr()) // confirmable_messages defaults to true
 	outputConf, cleanupConf := setupCoapOutput(t, confConfirmable)
 
-	err := outputConf.Write(context.Background(), service.MessageBatch{service.NewMessage([]byte("confirm this"))})
+	err := outputConf.WriteBatch(context.Background(), service.MessageBatch{service.NewMessage([]byte("confirm this"))})
 	require.NoError(t, err)
 	cleanupConf()
 
@@ -152,10 +215,13 @@ default_path: "/test"
 	mockServer.ClearRequestHistory()
 
 	// Test Non-Confirmable
-	confNonConfirmable := fmt.Sprintf(baseConf+"\nconfirmable_messages: false", mockServer.Addr())
+	confNonConfirmable := fmt.Sprintf(baseConf+`
+request_options:
+  confirmable: false
+`, mockServer.Addr())
 	outputNonConf, cleanupNonConf := setupCoapOutput(t, confNonConfirmable)
 
-	err = outputNonConf.Write(context.Background(), service.MessageBatch{service.NewMessage([]byte("non-confirm this"))})
+	err = outputNonConf.WriteBatch(context.Background(), service.MessageBatch{service.NewMessage([]byte("non-confirm this"))})
 	require.NoError(t, err)
 	cleanupNonConf()
 
@@ -165,7 +231,7 @@ default_path: "/test"
 }
 
 func TestCoapOutput_Integration_ContentFormatHandling(t *testing.T) {
-	mockServer, serverCleanup := testing.SetupTestServer(t)
+	mockServer, serverCleanup := mockserver.SetupTestServer(t)
 	defer serverCleanup()
 
 	path := "/contenttype"
@@ -197,9 +263,9 @@ func TestCoapOutput_Integration_ContentFormatHandling(t *testing.T) {
 			expectedServerFormat: coapMessage.AppXML,
 		},
 		{
-			name:                 "no_format_specified_defaults_to_plugin_default", // which is text/plain
+			name:                 "no_format_specified_defaults_to_plugin_default", // which is application/json
 			payload:              "default case",
-			expectedServerFormat: coapMessage.TextPlain,
+			expectedServerFormat: coapMessage.AppJSON,
 		},
 		{
 			name:                 "empty_metadata_uses_config_format",
@@ -215,11 +281,13 @@ func TestCoapOutput_Integration_ContentFormatHandling(t *testing.T) {
 			mockServer.ClearRequestHistory()
 
 			confYAML := fmt.Sprintf(`
-url: "coap://%s%s"
-default_method: "POST"
+endpoints: ["coap://%s"]
+default_path: "%s"
+request_options:
+  default_method: "POST"
 `, mockServer.Addr(), path)
 			if tc.configFormat != "" {
-				confYAML += fmt.Sprintf("default_content_format: \"%s\"\n", tc.configFormat)
+				confYAML += fmt.Sprintf("  content_format: \"%s\"\n", tc.configFormat)
 			}
 
 			output, cleanup := setupCoapOutput(t, confYAML)
@@ -227,13 +295,13 @@ default_method: "POST"
 
 			msg := service.NewMessage([]byte(tc.payload))
 			if tc.metadataFormat != "" { // Only set if tc.metadataFormat is not empty
-				msg.MetaSet("coap_content_format", tc.metadataFormat)
+				msg.MetaSet("content_type", tc.metadataFormat)
 			} else if tc.metadataFormat == "" && tc.name == "empty_metadata_uses_config_format" {
 				// Special case to test explicit empty metadata value
-				msg.MetaSet("coap_content_format", "")
+				msg.MetaSet("content_type", "")
 			}
 
-			err := output.Write(context.Background(), service.MessageBatch{msg})
+			err := output.WriteBatch(context.Background(), service.MessageBatch{msg})
 			require.NoError(t, err)
 
 			history := mockServer.GetRequestHistory()
@@ -241,12 +309,8 @@ default_method: "POST"
 			req := history[0]
 
 			actualFormat, err := req.Options.ContentFormat()
-			if tc.expectedServerFormat == coapMessage.заповедникContentFormat { // Expect no format
-				assert.Error(t, err, "Expected error getting content format when none should be set")
-			} else {
-				require.NoError(t, err, "Error getting content format from request")
-				assert.Equal(t, tc.expectedServerFormat, actualFormat, "ContentFormat mismatch")
-			}
+			require.NoError(t, err, "Error getting content format from request")
+			assert.Equal(t, tc.expectedServerFormat, actualFormat, "ContentFormat mismatch")
 		})
 	}
 }
@@ -254,22 +318,24 @@ default_method: "POST"
 // --- Tests requiring MockResource enhancements (Delay, ResponseSequence) ---
 
 func TestCoapOutput_Integration_RequestTimeout(t *testing.T) {
-	mockServer, serverCleanup := testing.SetupTestServer(t)
+	mockServer, serverCleanup := mockserver.SetupTestServer(t)
 	defer serverCleanup()
 
 	timeoutPath := "/timeout"
 	resourceData := []byte("some data")
 
 	// Configure resource to delay
-	// Need a way to update resource on mockServer, or AddResource should allow setting these
 	mockServer.AddResource(timeoutPath, coapMessage.TextPlain, resourceData, false)
-	res, _ := mockServer.GetResource(timeoutPath) // Get the resource to modify its properties
-	res.ResponseDelay = 200 * time.Millisecond    // Delay longer than client timeout
+	delayErr := mockServer.SetResourceDelay(timeoutPath, 200*time.Millisecond) // Delay longer than client timeout
+	require.NoError(t, delayErr)
 
 	conf := fmt.Sprintf(`
-url: "coap://%s%s"
-client_timeout: "50ms" # Short timeout
-max_retries: 0 # Disable Benthos retries to isolate CoAP client timeout
+endpoints: ["coap://%s"]
+default_path: "%s"
+request_options:
+  timeout: "50ms"
+retry_policy:
+  max_retries: 0
 `, mockServer.Addr(), timeoutPath)
 
 	output, outputCleanup := setupCoapOutput(t, conf)
@@ -278,7 +344,7 @@ max_retries: 0 # Disable Benthos retries to isolate CoAP client timeout
 	msgContent := "timeout test"
 	benthosMsg := service.NewMessage([]byte(msgContent))
 
-	err := output.Write(context.Background(), service.MessageBatch{benthosMsg})
+	err := output.WriteBatch(context.Background(), service.MessageBatch{benthosMsg})
 	require.Error(t, err, "Expected an error due to CoAP request timeout")
 	// Check if the error is context.DeadlineExceeded or contains a timeout message
 	// This depends on how the go-coap client and Benthos error wrapping behave.
@@ -292,35 +358,35 @@ max_retries: 0 # Disable Benthos retries to isolate CoAP client timeout
 	assert.GreaterOrEqual(t, len(history), 1, "Server should have received at least one attempt")
 }
 
-// Helper to update/set resource with response sequence on MockCoAPServer
-func (s *testing.MockCoAPServer) SetResourceResponseSequence(path string, seq []codes.Code, data []byte, contentType coapMessage.MediaType, observable bool, opts ...coapMessage.Option) {
-	s.MuLock() // Use a method to access the mutex if available, otherwise direct access for test helper
-	defer s.MuUnlock()
+// Helper to set resource with response sequence on MockCoAPServer
+func setResourceResponseSequence(server *mockserver.MockCoAPServer, path string, seq []codes.Code, data []byte, contentType coapMessage.MediaType, observable bool, opts ...coapMessage.Option) {
+	server.MuLock()
+	defer server.MuUnlock()
 
-	resource, exists := s.GetResourceInternal(path) // Assuming GetResourceInternal for direct map access
+	resource, exists := server.GetResourceInternal(path)
 	if !exists {
-		resource = &testing.MockResource{
+		resource = &mockserver.MockResource{
 			Path:             path,
 			Observable:       observable,
 			ServeWithOptions: opts,
 		}
-		s.SetResourceInternal(path, resource) // Assuming SetResourceInternal for direct map access
+		server.SetResourceInternal(path, resource)
 	}
 	resource.ResponseSequence = seq
 	resource.Data = data
 	resource.ContentType = contentType
-	resource.currentResponseIndex = 0
+	resource.CurrentResponseIndex = 0
 }
 
 func TestCoapOutput_Integration_RetryPolicy(t *testing.T) {
-	mockServer, serverCleanup := testing.SetupTestServer(t)
+	mockServer, serverCleanup := mockserver.SetupTestServer(t)
 	defer serverCleanup()
 
 	retryPath := "/retry"
 	finalPayload := []byte("final success data") // Data for the successful attempt
 
 	// Configure resource to fail twice then succeed
-	mockServer.SetResourceResponseSequence(retryPath,
+	setResourceResponseSequence(mockServer, retryPath,
 		[]codes.Code{codes.ServiceUnavailable, codes.InternalServerError, codes.Changed}, // Fail, Fail, Success
 		finalPayload, // Data associated with the final successful response
 		coapMessage.TextPlain,
@@ -328,13 +394,15 @@ func TestCoapOutput_Integration_RetryPolicy(t *testing.T) {
 	)
 
 	conf := fmt.Sprintf(`
-url: "coap://%s%s"
-default_method: "PUT"
-default_content_format: "application/octet-stream"
-retries:
+endpoints: ["coap://%s"]
+default_path: "%s"
+request_options:
+  default_method: "PUT"
+  content_format: "application/octet-stream"
+retry_policy:
   initial_interval: "10ms"
-  max_interval: "20ms" # Keep max interval short for faster test
-  max_retries: 3       # Allow enough retries for the sequence (2 fails + 1 success)
+  max_interval: "20ms"
+  max_retries: 3
 `, mockServer.Addr(), retryPath)
 
 	output, outputCleanup := setupCoapOutput(t, conf)
@@ -342,7 +410,7 @@ retries:
 
 	benthosMsg := service.NewMessage([]byte("retry this data"))
 
-	err := output.Write(context.Background(), service.MessageBatch{benthosMsg})
+	err := output.WriteBatch(context.Background(), service.MessageBatch{benthosMsg})
 	require.NoError(t, err, "Expected write to succeed after retries")
 
 	history := mockServer.GetRequestHistory()
@@ -367,30 +435,32 @@ retries:
 }
 
 func TestCoapOutput_Integration_ServerErrorHandling(t *testing.T) {
-	mockServer, serverCleanup := testing.SetupTestServer(t)
+	mockServer, serverCleanup := mockserver.SetupTestServer(t)
 	defer serverCleanup()
 
 	errorPath := "/permanenterror"
 
 	conf := fmt.Sprintf(`
-url: "coap://%s%s"
-default_method: "POST"
-retries: 
-  max_retries: 0 # Disable Benthos retries to see the direct error from the first attempt
+endpoints: ["coap://%s"]
+default_path: "%s"
+request_options:
+  default_method: "POST"
+retry_policy:
+  max_retries: 0
 `, mockServer.Addr(), errorPath)
 	output, outputCleanup := setupCoapOutput(t, conf)
 	defer outputCleanup()
 
 	// Scenario 1: Server returns 4.00 Bad Request
 	errorPayloadBadRequest := []byte("Details for bad request")
-	mockServer.SetResourceResponseSequence(errorPath,
+	setResourceResponseSequence(mockServer, errorPath,
 		[]codes.Code{codes.BadRequest},
 		errorPayloadBadRequest,
 		coapMessage.TextPlain, false)
 
 	msgBadRequest := service.NewMessage([]byte("test data for bad request"))
 
-	err := output.Write(context.Background(), service.MessageBatch{msgBadRequest})
+	err := output.WriteBatch(context.Background(), service.MessageBatch{msgBadRequest})
 	require.Error(t, err, "Expected an error for 4.00 Bad Request")
 	// Note: Benthos might wrap this error. Checking for specific CoAP error codes
 	// in the returned error would require deeper inspection or custom error types from the plugin.
@@ -399,14 +469,14 @@ retries:
 	// Scenario 2: Server returns 5.03 Service Unavailable
 	mockServer.ClearRequestHistory() // Clear for next scenario
 	errorPayloadServiceUnavail := []byte("Details for service unavailable")
-	mockServer.SetResourceResponseSequence(errorPath,
+	setResourceResponseSequence(mockServer, errorPath,
 		[]codes.Code{codes.ServiceUnavailable},
 		errorPayloadServiceUnavail,
 		coapMessage.TextPlain, false)
 
 	msgServiceUnavailable := service.NewMessage([]byte("test data for service unavailable"))
 
-	err = output.Write(context.Background(), service.MessageBatch{msgServiceUnavailable})
+	err = output.WriteBatch(context.Background(), service.MessageBatch{msgServiceUnavailable})
 	require.Error(t, err, "Expected an error for 5.03 Service Unavailable")
 	t.Logf("Received error for 5.03: %v", err)
 

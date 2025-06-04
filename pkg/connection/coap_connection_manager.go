@@ -4,6 +4,7 @@ package connection
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,11 +12,12 @@ import (
 )
 
 type Manager struct {
-	pools   map[string]*ConnectionPool
-	config  Config
-	logger  *service.Logger
-	metrics *Metrics
-	mu      sync.RWMutex
+	pools        map[string]*ConnectionPool
+	endpointMap  map[string]string // maps cleaned endpoint to original endpoint
+	config       Config
+	logger       *service.Logger
+	metrics      *Metrics
+	mu           sync.RWMutex
 }
 
 type Config struct {
@@ -48,9 +50,10 @@ type Metrics struct {
 
 func NewManager(config Config, logger *service.Logger, metrics *service.Resources) (*Manager, error) {
 	m := &Manager{
-		pools:  make(map[string]*ConnectionPool),
-		config: config,
-		logger: logger,
+		pools:       make(map[string]*ConnectionPool),
+		endpointMap: make(map[string]string),
+		config:      config,
+		logger:      logger,
 		metrics: &Metrics{
 			ConnectionsActive:  metrics.Metrics().NewCounter("coap_connections_active"),
 			ConnectionsCreated: metrics.Metrics().NewCounter("coap_connections_created"),
@@ -66,11 +69,16 @@ func NewManager(config Config, logger *service.Logger, metrics *service.Resource
 	}
 
 	for _, endpoint := range config.Endpoints {
-		pool, err := NewConnectionPool(endpoint, config, factory, logger, m.metrics)
+		// Strip scheme from endpoint for the factory
+		cleanEndpoint := stripScheme(endpoint)
+		pool, err := NewConnectionPool(cleanEndpoint, config, factory, logger, m.metrics)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create pool for %s: %w", endpoint, err)
 		}
+		// Use original endpoint as key to maintain compatibility
 		m.pools[endpoint] = pool
+		// Map cleaned endpoint back to original for Put operations
+		m.endpointMap[cleanEndpoint] = endpoint
 	}
 
 	return m, nil
@@ -98,15 +106,25 @@ func (m *Manager) Get(ctx context.Context) (*ConnectionWrapper, error) {
 
 func (m *Manager) Put(conn *ConnectionWrapper) {
 	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Try to find pool using the connection's endpoint directly
 	pool, exists := m.pools[conn.endpoint]
-	m.mu.RUnlock()
+	if !exists {
+		// If not found, check if it's a cleaned endpoint that maps to an original
+		if originalEndpoint, mapped := m.endpointMap[conn.endpoint]; mapped {
+			pool, exists = m.pools[originalEndpoint]
+		}
+	}
 
 	if exists {
 		pool.Put(conn)
 	} else {
 		m.logger.Warnf("Attempted to return connection to non-existent pool, endpoint: %s", conn.endpoint)
-		if pool.factory != nil {
-			pool.factory.Close(conn.conn)
+		// We need to get the factory to close the connection, but we can't access pool.factory if pool is nil
+		// Let's create a temporary factory to close it properly
+		if factory, err := m.createFactory(); err == nil {
+			factory.Close(conn.conn)
 		}
 	}
 }
@@ -129,4 +147,18 @@ func (m *Manager) Close() error {
 		}
 	}
 	return lastErr
+}
+
+// stripScheme removes the protocol scheme from an endpoint URL
+// Examples: "coap://host:port" -> "host:port", "host:port" -> "host:port"
+func stripScheme(endpoint string) string {
+	// Handle coap:// and coaps:// schemes
+	if strings.HasPrefix(endpoint, "coap://") {
+		return strings.TrimPrefix(endpoint, "coap://")
+	}
+	if strings.HasPrefix(endpoint, "coaps://") {
+		return strings.TrimPrefix(endpoint, "coaps://")
+	}
+	// Return as-is if no scheme found
+	return endpoint
 }
