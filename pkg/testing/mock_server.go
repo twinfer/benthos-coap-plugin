@@ -107,9 +107,12 @@ type MockResource struct {
 	Data                 []byte            // Current data/payload of the resource.
 	Observable           bool              // Flag indicating if the resource supports CoAP observation.
 	ObserveSeq           uint32            // Current observe sequence number for notifications.
-	LastModified         time.Time         // Timestamp of the last modification to the resource.
-	ServeWithOptions     []message.Option  // CoAP options to be included in responses for GET requests to this resource.
-	LastPutOrPostOptions []message.Option  // CoAP options received in the last PUT or POST request to this resource.
+	LastModified         time.Time          // Timestamp of the last modification to the resource.
+	ServeWithOptions     []message.Option   // CoAP options to be included in responses for GET requests to this resource.
+	LastPutOrPostOptions []message.Option   // CoAP options received in the last PUT or POST request to this resource.
+	ResponseDelay        time.Duration      // Optional delay to introduce before sending a response.
+	ResponseSequence     []codes.Code       // Optional sequence of CoAP codes to respond with. Cycles through them.
+	currentResponseIndex int                // Internal: tracks the current index for ResponseSequence.
 }
 
 // Observer represents an active CoAP observer client for a specific resource.
@@ -309,29 +312,65 @@ type GetHandler struct {
 // HandleRequest processes GET requests. It supports regular GET and observe registration.
 // It checks if the resource exists, if it's observable (for observe requests),
 // and sends the appropriate response including CoAP options like Observe and ETag (if defined).
+// It also incorporates any configured ResponseDelay or ResponseSequence for the resource.
 func (h *GetHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path string) {
-	h.server.mu.RLock() // Read lock is sufficient as we are primarily reading resource data.
+	h.server.mu.Lock() // Use full lock to safely access and update resource.currentResponseIndex
 	resource, exists := h.server.resources[path]
-	h.server.mu.RUnlock()
 
-	if !exists {
-		if err := w.SetResponse(codes.NotFound, message.TextPlain, []byte("Resource not found")); err != nil {
-			fmt.Printf("MockCoAPServer ERROR: [GET %s] Failed to set NotFound response: %v\n", path, err)
+	responseCode := codes.Content // Default success code for GET
+	var responsePayload []byte    // Store raw payload bytes
+	var responseOptions []message.Option
+	var responseContentType message.MediaType
+
+	if exists {
+		if resource.ResponseDelay > 0 {
+			time.Sleep(resource.ResponseDelay)
+		}
+		if len(resource.ResponseSequence) > 0 {
+			responseCode = resource.ResponseSequence[resource.currentResponseIndex]
+			resource.currentResponseIndex = (resource.currentResponseIndex + 1) % len(resource.ResponseSequence)
+		}
+
+		responsePayload = resource.Data
+		responseOptions = resource.ServeWithOptions
+		responseContentType = resource.ContentType
+	} else {
+		responseCode = codes.NotFound
+		responseContentType = message.TextPlain
+		responsePayload = []byte("Resource not found")
+	}
+	h.server.mu.Unlock() // Unlock after accessing/modifying resource state
+
+	if !exists { // Handle not found case after unlock
+		// Use bytes.NewReader for payload when calling SetResponse for consistency
+		if err := w.SetResponse(responseCode, responseContentType, bytes.NewReader(responsePayload)); err != nil {
+			fmt.Printf("MockCoAPServer ERROR: [GET %s] Failed to set %s response: %v\n", path, responseCode, err)
 		}
 		return
 	}
 
+	// If we are here, resource exists.
+	// If the responseCode determined by ResponseSequence is an error code, send it directly.
+	if responseCode >= codes.BadRequest {
+		errorMsg := responsePayload
+		if len(errorMsg) == 0 { // Default error payload if resource.Data is empty for an error code
+			errorMsg = []byte(fmt.Sprintf("GET failed with server configured error: %s", responseCode.String()))
+		}
+		// Use the original resource content type if available, otherwise default to text/plain for errors
+		ct := responseContentType
+		if ct == 0 { // Assuming 0 is not a valid explicit content type / means not set. plgd-dev/go-coap uses 0 as a sentinel for no format.
+			ct = message.TextPlain
+		}
+		h.server.setResponseWithOptions(w, responseCode, ct, errorMsg, responseOptions, path)
+		return
+	}
+
+	// Proceed with observe logic or regular GET if success code
 	reqOpts := r.Options()
 	if observeVal, err := reqOpts.GetUint32(message.Observe); err == nil && observeVal == 0 { // Observe registration
 		if resource.Observable {
-			// AddObserver needs to acquire a write lock on server.mu if it modifies shared observer list.
-			// Consider if GetHandler should have its own lock or if server.addObserver handles synchronization.
-			// For now, assuming server.addObserver is thread-safe.
 			h.server.addObserver(path, r.Token(), w)
-
-			// Send initial response with Observe option
-			// Pass the 'path' for logging context in setResponseWithOptions
-			h.server.setResponseWithOptions(w, codes.Content, resource.ContentType, resource.Data, resource.ServeWithOptions, path)
+			h.server.setResponseWithOptions(w, responseCode, responseContentType, responsePayload, responseOptions, path)
 
 			rw, ok := w.(responseWriterWithOptions)
 			if !ok {
@@ -355,8 +394,8 @@ func (h *GetHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path st
 				fmt.Printf("MockCoAPServer ERROR: [GET %s] Failed to set NotAcceptable response for non-observable resource: %v\n", path, err)
 			}
 		}
-	} else { // Regular GET
-		h.server.setResponseWithOptions(w, codes.Content, resource.ContentType, resource.Data, resource.ServeWithOptions, path)
+	} else { // Regular GET or GET for already observing client (no observe option in this request)
+		h.server.setResponseWithOptions(w, responseCode, responseContentType, responsePayload, responseOptions, path)
 	}
 }
 
@@ -464,6 +503,7 @@ type PostHandler struct {
 // or updating an existing one. This implementation creates the resource if it doesn't exist.
 // It updates the resource's data, content type, and last modified time.
 // If the resource is observable, it triggers notifications.
+// It also incorporates any configured ResponseDelay or ResponseSequence for the resource.
 func (h *PostHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path string) {
 	h.server.mu.Lock() // Lock for modifying resources map and resource fields
 	reqOpts := r.Options()
@@ -478,9 +518,21 @@ func (h *PostHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path s
 		h.server.resources[path] = resource
 	}
 	resource.LastPutOrPostOptions = optsCopy // Store received options on the resource
-	h.server.mu.Unlock() // Unlock early before I/O and potential UpdateResource call (which locks)
 
-	// Payload processing should occur after critical section if possible
+	// Handle ResponseDelay and ResponseSequence
+	responseCode := codes.Created // Default for POST
+	if resource.ResponseDelay > 0 {
+		time.Sleep(resource.ResponseDelay)
+	}
+	if len(resource.ResponseSequence) > 0 {
+		responseCode = resource.ResponseSequence[resource.currentResponseIndex]
+		resource.currentResponseIndex = (resource.currentResponseIndex + 1) % len(resource.ResponseSequence)
+	}
+	// Note: For POST, if resource didn't exist, it's created above.
+	// The ResponseSequence and ResponseDelay are applied based on the resource state *after* potential creation.
+	h.server.mu.Unlock() // Unlock after accessing/modifying resource state
+
+	// Payload processing
 	data, err := io.ReadAll(r.Body()) // Read payload from mux.Message's Body
 	if err != nil {
 		fmt.Printf("MockCoAPServer ERROR: [POST %s] Failed to read request payload: %v\n", path, err)
@@ -512,8 +564,16 @@ func (h *PostHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path s
 		}
 	}
 
-	if errSetResp := w.SetResponse(codes.Created, message.TextPlain, nil); errSetResp != nil {
-		fmt.Printf("MockCoAPServer ERROR: [POST %s] Failed to set Created response: %v\n", path, errSetResp)
+	// Respond based on determined responseCode
+	if responseCode < codes.BadRequest { // Success codes like 2.01 Created or 2.04 Changed (if POST allows Changed)
+		if errSetResp := w.SetResponse(responseCode, message.TextPlain, nil); errSetResp != nil {
+			fmt.Printf("MockCoAPServer ERROR: [POST %s] Failed to set %s response: %v\n", path, responseCode, errSetResp)
+		}
+	} else { // Error codes
+		errorPayload := []byte(fmt.Sprintf("POST failed with server configured error: %s", responseCode.String()))
+		if errSetResp := w.SetResponse(responseCode, message.TextPlain, bytes.NewReader(errorPayload)); errSetResp != nil {
+			fmt.Printf("MockCoAPServer ERROR: [POST %s] Failed to set %s error response: %v\n", path, responseCode, errSetResp)
+		}
 	}
 }
 
@@ -525,6 +585,7 @@ type PutHandler struct {
 // HandleRequest processes PUT requests. It's used for creating a resource at a specific URI
 // or replacing an existing one. This implementation creates if not exist or updates if present.
 // It updates data, content type, and potentially triggers observe notifications.
+// It also incorporates any configured ResponseDelay or ResponseSequence for the resource.
 func (h *PutHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path string) {
 	h.server.mu.Lock() // Lock for resource map and fields
 	reqOpts := r.Options()
@@ -540,7 +601,20 @@ func (h *PutHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path st
 		h.server.resources[path] = resource
 	}
 	resource.LastPutOrPostOptions = optsCopy
-	h.server.mu.Unlock() // Unlock early before I/O and UpdateResource
+
+	responseCode := codes.Changed // Default for PUT update
+	if created {
+		responseCode = codes.Created // Default for PUT create
+	}
+
+	if resource.ResponseDelay > 0 {
+		time.Sleep(resource.ResponseDelay)
+	}
+	if len(resource.ResponseSequence) > 0 {
+		responseCode = resource.ResponseSequence[resource.currentResponseIndex]
+		resource.currentResponseIndex = (resource.currentResponseIndex + 1) % len(resource.ResponseSequence)
+	}
+	h.server.mu.Unlock() // Unlock after accessing/modifying resource state
 
 	data, err := io.ReadAll(r.Body()) // Read payload from mux.Message's Body
 	if err != nil {
@@ -573,12 +647,16 @@ func (h *PutHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path st
 		// For now, assume UpdateResource's error is about notifications.
 	}
 
-	responseCode := codes.Changed
-	if created { // If the PUT created the resource
-		responseCode = codes.Created
-	}
-	if errSetResp := w.SetResponse(responseCode, message.TextPlain, nil); errSetResp != nil {
-		fmt.Printf("MockCoAPServer ERROR: [PUT %s] Failed to set %s response: %v\n", path, responseCode, errSetResp)
+	// Respond based on determined responseCode
+	if responseCode < codes.BadRequest { // Success codes
+		if errSetResp := w.SetResponse(responseCode, message.TextPlain, nil); errSetResp != nil {
+			fmt.Printf("MockCoAPServer ERROR: [PUT %s] Failed to set %s response: %v\n", path, responseCode, errSetResp)
+		}
+	} else { // Error codes
+		errorPayload := []byte(fmt.Sprintf("PUT failed with server configured error: %s", responseCode.String()))
+		if errSetResp := w.SetResponse(responseCode, message.TextPlain, bytes.NewReader(errorPayload)); errSetResp != nil {
+			fmt.Printf("MockCoAPServer ERROR: [PUT %s] Failed to set %s error response: %v\n", path, responseCode, errSetResp)
+		}
 	}
 }
 
@@ -588,25 +666,45 @@ type DeleteHandler struct {
 }
 
 // HandleRequest processes DELETE requests. It removes the specified resource and any associated observers.
+// It also incorporates any configured ResponseDelay or ResponseSequence for the resource.
 func (h *DeleteHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path string) {
 	h.server.mu.Lock() // Lock for modifying resources and observers maps
-	defer h.server.mu.Unlock()
 
-	if _, exists := h.server.resources[path]; !exists {
-		if err := w.SetResponse(codes.NotFound, message.TextPlain, []byte("Resource not found")); err != nil {
-			fmt.Printf("MockCoAPServer ERROR: [DELETE %s] Failed to set NotFound response: %v\n", path, err)
+	resource, exists := h.server.resources[path]
+	responseCode := codes.Deleted // Default for successful DELETE
+
+	if exists {
+		if resource.ResponseDelay > 0 {
+			time.Sleep(resource.ResponseDelay)
 		}
-		return
+		if len(resource.ResponseSequence) > 0 {
+			responseCode = resource.ResponseSequence[resource.currentResponseIndex]
+			resource.currentResponseIndex = (resource.currentResponseIndex + 1) % len(resource.ResponseSequence)
+		}
+	} else {
+		responseCode = codes.NotFound
 	}
 
-	delete(h.server.resources, path)
-	// Also remove observers for this path to prevent attempts to notify on a deleted resource.
-	delete(h.server.observers, path) // This removes all observers for the path.
-	// TODO: Future: If more granular control is needed, iterate through observers and mark them inactive,
-	// allowing for potential cleanup or specific observer removal logic.
+	if responseCode == codes.Deleted { // Only delete if the effective code is Deleted
+		delete(h.server.resources, path)
+		delete(h.server.observers, path) // Also remove any observers for this path
+	}
+	h.server.mu.Unlock()
 
-	if err := w.SetResponse(codes.Deleted, message.TextPlain, nil); err != nil {
-		fmt.Printf("MockCoAPServer ERROR: [DELETE %s] Failed to set Deleted response: %v\n", path, err)
+
+	// Respond based on determined responseCode
+	var responsePayloadReader io.ReadSeeker // Payload is typically empty for DELETE success/notfound
+	responseContentType := message.TextPlain // Content type for error payloads (if any)
+
+	if responseCode == codes.NotFound {
+		responsePayloadReader = bytes.NewReader([]byte("Resource not found"))
+	} else if responseCode >= codes.BadRequest { // Other errors
+		responsePayloadReader = bytes.NewReader([]byte(fmt.Sprintf("DELETE failed with server configured error: %s", responseCode.String())))
+	}
+
+
+	if err := w.SetResponse(responseCode, responseContentType, responsePayloadReader); err != nil {
+		fmt.Printf("MockCoAPServer ERROR: [DELETE %s] Failed to set %s response: %v\n", path, responseCode, err)
 	}
 }
 
