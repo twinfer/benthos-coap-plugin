@@ -12,20 +12,28 @@ input:
       - "/sensors/+/data"  # Wildcard for multiple sensors
     protocol: "udp"
     connection_pool:
-      max_size: 10
-      idle_timeout: "60s"
-      health_check_interval: "30s"
+      max_size: 10 # User override (Default: 5)
+      idle_timeout: "60s" # User override (Default: "30s")
+      health_check_interval: "30s" # User override (Default: "10s")
+      # connect_timeout: "10s" # Default
     observer:
-      buffer_size: 5000
-      observe_timeout: "10m"
+      buffer_size: 5000 # User override (Default: 1000)
+      observe_timeout: "10m" # User override (Default: "5m")
+      # resubscribe_delay: "5s" # Default
     retry_policy:
-      max_retries: 5
-      initial_interval: "2s"
-      max_interval: "60s"
+      max_retries: 5 # User override (Default: 3)
+      initial_interval: "2s" # User override (Default: "1s")
+      max_interval: "60s" # User override (Default: "30s")
+      # multiplier: 2.0 # Default
+      # jitter: true # Default
     circuit_breaker:
-      enabled: true
-      failure_threshold: 3
-      timeout: "30s"
+      enabled: true # Default
+      failure_threshold: 3 # User override (Default: 5)
+      timeout: "30s" # Default
+      # success_threshold: 3 # Default
+      # half_open_max_calls: 2 # Default
+    # security: # Using defaults (mode: "none")
+    # converter: # Using defaults (default_content_format: "application/json", preserve_options: false, etc.)
 
 pipeline:
   processors:
@@ -66,13 +74,20 @@ output:
     default_path: "/commands"
     protocol: "udp"
     request_options:
-      confirmable: true
-      timeout: "10s"
-      content_format: "application/json"
+      confirmable: true # Default
+      # default_method: "POST" # Default
+      timeout: "10s" # User override (Default: "30s")
+      content_format: "application/json" # Default
+      # auto_detect_format: true # Default
     retry_policy:
-      max_retries: 3
-      initial_interval: "1s"
-      max_interval: "10s"
+      max_retries: 3 # Default
+      initial_interval: "1s" # User override (Default: "500ms")
+      max_interval: "10s" # Default
+      # multiplier: 1.5 # Default
+      # jitter: true # Default
+    # security: # Using defaults (mode: "none")
+    # connection_pool: # Using defaults
+    # converter: # Using defaults
 
 ---
 
@@ -90,8 +105,14 @@ input:
       psk_identity: "client-001"
       psk_key: "${COAP_PSK_KEY}"
     connection_pool:
-      max_size: 5
-      health_check_interval: "10s"
+      max_size: 5 # Default
+      # idle_timeout: "30s" # Default
+      health_check_interval: "10s" # Default
+      # connect_timeout: "10s" # Default
+    # observer: # Using defaults
+    # retry_policy: # Using defaults
+    # circuit_breaker: # Using defaults
+    # converter: # Using defaults
 
 output:
   stdout: {}
@@ -112,8 +133,15 @@ input:
       cert_file: "/etc/ssl/client.crt"
       key_file: "/etc/ssl/client.key"
       ca_cert_file: "/etc/ssl/ca.crt"
+      # insecure_skip_verify: false # Default
     observer:
-      buffer_size: 10000
+      buffer_size: 10000 # User override (Default: 1000)
+      # observe_timeout: "5m" # Default
+      # resubscribe_delay: "5s" # Default
+    # connection_pool: # Using defaults
+    # retry_policy: # Using defaults
+    # circuit_breaker: # Using defaults
+    # converter: # Using defaults
 
 pipeline:
   processors:
@@ -139,10 +167,18 @@ input:
       - "/stream/data"
     protocol: "tcp"  # TCP for higher throughput
     observer:
-      buffer_size: 50000
+      buffer_size: 50000 # User override (Default: 1000)
+      # observe_timeout: "5m" # Default
+      # resubscribe_delay: "5s" # Default
     converter:
-      compression_enabled: true
-      max_payload_size: 2097152  # 2MB
+      # default_content_format: "application/json" # Default
+      compression_enabled: true # Default
+      max_payload_size: 2097152  # 2MB, User override (Default: 1048576)
+      # preserve_options: false # Default
+    # security: # Using defaults
+    # connection_pool: # Using defaults
+    # retry_policy: # Using defaults
+    # circuit_breaker: # Using defaults
 
 pipeline:
   processors:
@@ -219,9 +255,17 @@ input:
       - "coap://localhost:5683"
     observe_paths:
       - "/debug/test"
-    protocol: "udp"
+    protocol: "udp" # Default
     converter:
-      preserve_options: true  # Keep all CoAP options for debugging
+      # default_content_format: "application/json" # Default
+      # compression_enabled: true # Default
+      # max_payload_size: 1048576 # Default (1MB)
+      preserve_options: true  # User override (Default: false)
+    # security: # Using defaults
+    # connection_pool: # Using defaults
+    # observer: # Using defaults
+    # retry_policy: # Using defaults
+    # circuit_breaker: # Using defaults
 
 pipeline:
   processors:

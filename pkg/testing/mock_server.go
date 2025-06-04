@@ -1,26 +1,163 @@
 // pkg/testing/mock_server.go
 
-// Package testing provides utilities for integration testing of CoAP applications.
+// Package testing provides utilities for integration testing of CoAP (Constrained Application Protocol) applications.
 //
-// The primary component is MockCoAPServer, a configurable in-memory CoAP server
-// that allows simulating various CoAP resource behaviors, including observability (RFC 7641).
-// It supports:
-//   - Defining resources with specific content types, data, and observable behavior.
-//   - Handling GET, POST, PUT, DELETE requests through a flexible handler interface.
-//   - Capturing incoming requests for detailed inspection in tests (request history).
-//   - Simulating resource updates and notifying active observers.
-//   - Methods to inspect server state, such as active observers and resource data.
+// The primary component is MockCoAPServer, an in-memory CoAP server designed for configurability
+// and simulation of various CoAP resource behaviors, including observability as defined in RFC 7641.
 //
-// MockCoAPClient is a basic client for interacting with the MockCoAPServer or other
-// CoAP servers in test scenarios.
+// Key Features of MockCoAPServer:
+//   - Dynamic Resource Management: Allows defining resources with specific content types,
+//     data payloads, and observable characteristics. Resources can be added, updated, or removed at runtime.
+//   - Extensible Request Handling: Utilizes a `RequestHandler` interface, enabling customized processing
+//     for different CoAP methods (GET, POST, PUT, DELETE). Default handlers are provided for common operations.
+//   - Observability Simulation (RFC 7641): Supports CoAP observe requests. Resources can be marked as
+//     observable, and updates to such resources will trigger notification messages to registered observers.
+//   - Detailed Request Logging: Captures details of incoming CoAP requests (method, path, token, options, payload)
+//     into a request history, which can be inspected by tests for assertion purposes. All logged data is deep-copied
+//     to ensure immutability and prevent unintended side effects.
+//   - Response Customization: Allows configuring response delays and sequences of response codes for resources,
+//     facilitating the simulation of various network conditions and server behaviors (e.g., transient errors).
+//   - Concurrency-Safe: Designed for safe use in concurrent testing scenarios, with internal state protected by mutexes.
+//   - Server State Inspection: Provides methods to query server state, such as the number of active observers
+//     for a resource, current resource data, and the history of received requests.
 //
-// This package aims to simplify the setup of CoAP integration tests by providing
-// controllable server and client components, reducing the need for external dependencies
-// or complex network configurations during testing.
+// MockCoAPClient:
+//   A basic CoAP client is also provided for straightforward interaction with the MockCoAPServer or other
+//   CoAP servers within test environments. It simplifies sending requests and receiving responses.
+//
+// Overall, this package aims to streamline the development of CoAP integration tests by offering
+// controllable and introspectable server and client components, thereby reducing reliance on
+// external CoAP infrastructure or complex network setups during the testing phase.
 package testing
 
 import (
 	"bytes" // Required for converting payload []byte to io.Reader for client Post/Put.
+// It allows adding resources, simulating CoAP methods (GET, POST, PUT, DELETE),
+// and observing resource changes (RFC 7641).
+//
+// Key features:
+//   - Resource Management: Add, update, and delete resources dynamically.
+//   - Request Handling: Uses a RequestHandler interface for extensible processing of CoAP methods.
+//   - Observability: Supports CoAP observe; resources can be marked as observable, and updates trigger notifications.
+//   - Request History: Logs incoming requests (path, method, options, payload) for test assertions. All logged data is deep-copied.
+//   - Thread-Safe: Operations are protected by mutexes for safe concurrent access.
+//   - Response Customization: Supports configuring response delays and sequences of response codes per resource.
+type MockCoAPServer struct {
+	addr                 string
+	listener             *coapNet.UDPConn // Underlying CoAP UDP connection.
+	server               *server.Server                  // The core CoAP server instance.
+	resources            map[string]*MockResource        // Map of URI paths to their corresponding MockResource.
+	requestHandlers      map[codes.Code]RequestHandler // Map of CoAP codes to their respective handlers.
+	observers            map[string][]Observer           // Map of URI paths to lists of active observers.
+	lastReceivedOptions  map[string][]message.Option   // DEPRECATED: Use GetRequestHistory() for comprehensive details. Stores options of the last request per path.
+	lastReceivedMessages map[string]*message.Message   // DEPRECATED: Use GetRequestHistory() for comprehensive details. Stores the last message per path.
+	mu                   sync.RWMutex                    // Mutex for thread-safe access to shared server state (resources, observers, history, etc.).
+	running              bool                            // Indicates if the server is currently running and listening for requests.
+	cancel               context.CancelFunc              // Function to cancel the server's context, used for gracefully stopping the server.
+	requestHistory       []LoggedRequest                 // Log of received requests for test inspection. Each entry is a deep copy.
+	// TODO: Consider adding responseHistory for enhanced observability, potentially storing LoggedResponse structs if detailed response logging is needed.
+}
+
+// LoggedRequest stores detailed information about a CoAP request received by the MockCoAPServer.
+// This struct is used to populate the `requestHistory` for later inspection in tests.
+// All mutable fields (Token, Options, Payload) are deep copies of the original request data
+// to ensure they are not modified by subsequent processing or by the original sender after the request is logged.
+// This immutability is crucial for reliable test assertions.
+type LoggedRequest struct {
+	Timestamp time.Time         // Timestamp indicating when the server logged the request (UTC).
+	Path      string            // URI path extracted from the request (e.g., "/temperature").
+	Code      codes.Code        // CoAP method code (e.g., codes.GET, codes.POST, codes.PUT, codes.DELETE).
+	Token     message.Token     // CoAP token from the request (a deep copy).
+	Type      message.MessageType // CoAP message type (Confirmable, NonConfirmable, Acknowledgement, Reset).
+	Options   message.Options   // CoAP options included in the request (a deep copy, including option values).
+	Payload   []byte            // Payload/body of the request (a deep copy).
+}
+
+// responseWriterWithOptions is an internal interface used to abstract the setting of CoAP options
+// on a response writer. This is primarily a workaround for limitations in the underlying
+// CoAP library's mux.ResponseWriter interface, which does not directly expose methods like SetOptionBytes.
+// This interface allows the MockCoAPServer to leverage such methods if the concrete ResponseWriter type supports them.
+type responseWriterWithOptions interface {
+	mux.ResponseWriter
+	SetOptionBytes(id message.OptionID, value []byte) error
+}
+
+// MockResource represents a simulated CoAP resource within the MockCoAPServer.
+// It holds the resource's properties (path, content type, data), its observation-related state
+// (observable flag, sequence number), and configurations for simulating specific server behaviors
+// such as response delays or a predefined sequence of response codes.
+//
+// Fields:
+//   Path: URI path of the resource (e.g., "/sensors/temp").
+//   ContentType: CoAP content type for the resource's payload (e.g., message.AppJSON).
+//   Data: Current data/payload of the resource.
+//   Observable: Boolean flag indicating if the resource supports CoAP observation (RFC 7641).
+//   ObserveSeq: Current observe sequence number, incremented on updates if observable.
+//   LastModified: Timestamp (UTC) of the last modification.
+//   ServeWithOptions: CoAP options (e.g., ETag) included in GET responses for this resource.
+//   LastPutOrPostOptions: CoAP options from the last PUT or POST request to this resource, stored for inspection.
+//   ResponseDelay: Optional delay applied before sending a response, simulating latency.
+//   ResponseSequence: Optional sequence of CoAP codes for successive responses. Cycles through the sequence.
+//   currentResponseIndex: Internal index for the ResponseSequence.
+type MockResource struct {
+	Path                 string            // URI path of the resource (e.g., "/sensors/temp").
+	ContentType          message.MediaType   // CoAP content type of the resource's payload (e.g., message.AppJSON).
+	Data                 []byte            // Current data/payload of the resource. This is a direct byte slice.
+	Observable           bool              // Flag indicating if the resource supports CoAP observation (RFC 7641).
+	ObserveSeq           uint32            // Current observe sequence number for notifications. Incremented on updates.
+	LastModified         time.Time          // Timestamp of the last modification to the resource (UTC).
+	ServeWithOptions     []message.Option   // CoAP options to be included in responses for GET requests to this resource (e.g., ETag).
+	LastPutOrPostOptions []message.Option   // CoAP options received in the last PUT or POST request to this resource. Stored for inspection.
+	ResponseDelay        time.Duration      // Optional delay to introduce before sending a response, simulating network latency or slow processing.
+	ResponseSequence     []codes.Code       // Optional sequence of CoAP codes to respond with for successive requests. Cycles through them.
+	currentResponseIndex int                // Internal: tracks the current index for ResponseSequence.
+}
+
+// Observer represents an active CoAP observer client for a specific resource within the MockCoAPServer.
+// It stores the observer's identifying token and the ResponseWriter associated with the observation relationship,
+// which is used to send notifications (updates) back to the client.
+// The Active flag indicates if the server should still attempt to send notifications to this observer.
+//
+// Fields:
+//   Token: CoAP token that uniquely identifies the observation relationship. This is a deep copy.
+//   Response: The ResponseWriter used for sending notifications to the observer.
+//   Active: Flag indicating if the observer is still considered active. Marked false if notifications fail.
+type Observer struct {
+	Token    message.Token      // CoAP token that uniquely identifies the observation relationship.
+	Response mux.ResponseWriter // ResponseWriter for sending notifications (observe updates) to the observer.
+	Active   bool               // Flag indicating if the observer is still considered active. Becomes false if notifications fail.
+}
+
+// NewMockCoAPServer creates a new instance of MockCoAPServer.
+// It initializes the server with default request handlers for GET, POST, PUT, and DELETE methods.
+// The server is not started automatically; call Start() to begin listening for requests.
+func NewMockCoAPServer() *MockCoAPServer {
+	s := &MockCoAPServer{
+		resources:            make(map[string]*MockResource),
+		requestHandlers:      make(map[codes.Code]RequestHandler),
+		observers:            make(map[string][]Observer),
+		lastReceivedOptions:  make(map[string][]message.Option), // Kept for backward compatibility or specific uses.
+		lastReceivedMessages: make(map[string]*message.Message), // Kept for backward compatibility or specific uses.
+		requestHistory:       make([]LoggedRequest, 0, 100),     // Initialize requestHistory with a capacity of 100.
+	}
+	// Register default handlers
+	s.requestHandlers[codes.GET] = &GetHandler{server: s}
+	s.requestHandlers[codes.POST] = &PostHandler{server: s}
+	s.requestHandlers[codes.PUT] = &PutHandler{server: s}
+	s.requestHandlers[codes.DELETE] = &DeleteHandler{server: s}
+	return s
+// AddResource adds a new resource to the mock server or updates an existing one at the given path.
+//
+// Parameters:
+//   path: The URI path for the resource (e.g., "/temp", "/config/led").
+//   contentType: The CoAP message.MediaType to be used for the resource's payload.
+//   data: The initial byte slice data for the resource.
+//   observable: A boolean indicating whether this resource should support CoAP observations.
+//               If true, clients can register to observe changes.
+//   opts: A variadic slice of message.Option to be served with this resource on GET requests.
+//         These options (e.g., ETag) are added to every GET response for this resource.
+func (m *MockCoAPServer) AddResource(path string, contentType message.MediaType, data []byte, observable bool, opts ...message.Option) {
+	m.mu.Lock()
 	"context"
 	"fmt"
 	"io"
@@ -73,7 +210,7 @@ type MockCoAPServer struct {
 	running              bool                            // Indicates if the server is currently running.
 	cancel               context.CancelFunc              // Function to cancel the server's context, used for stopping.
 	requestHistory       []LoggedRequest                 // Log of received requests for test inspection.
-	// TODO: Add responseHistory for enhanced observability, potentially storing LoggedResponse structs.
+	// TODO: Consider adding responseHistory for enhanced observability, potentially storing LoggedResponse structs if detailed response logging is needed.
 }
 
 // LoggedRequest stores detailed information about a CoAP request received by the mock server.
@@ -242,7 +379,7 @@ func (m *MockCoAPServer) Start() error {
 		// Serve blocks until the listener is closed or an error occurs.
 		// Run in a goroutine to not block the Start() method.
 		if err := m.server.Serve(listener); err != nil && ctx.Err() == nil {
-			// Log errors from the underlying server unless the context was canceled (server stopped).
+			// Log errors from the underlying server unless the context was canceled (server stopped intentionally).
 			fmt.Printf("MockCoAPServer ERROR: [Start] Underlying server Serve() error: %v\n", err)
 		}
 	}()
@@ -298,26 +435,28 @@ func (m *MockCoAPServer) handleRequest(w mux.ResponseWriter, r *mux.Message) {
 	} else {
 		// Respond with MethodNotAllowed if no handler is registered for the CoAP code
 		// It's good practice to provide a payload explaining the error.
-		if errResp := w.SetResponse(codes.MethodNotAllowed, message.TextPlain, []byte("Method not allowed")); errResp != nil {
+		if errResp := w.SetResponse(codes.MethodNotAllowed, message.TextPlain, bytes.NewReader([]byte("Method not allowed"))); errResp != nil {
 			fmt.Printf("MockCoAPServer ERROR: [HandleRequest %s] Failed to set MethodNotAllowed response for code %s: %v\n", path, r.Code(), errResp)
 		}
 	}
 }
 
-// GetHandler implements RequestHandler for GET requests.
+// GetHandler implements RequestHandler for CoAP GET requests.
+// It retrieves resource data, handles observe registration (RFC 7641),
+// and applies any configured response customizations like delays or sequenced error codes.
 type GetHandler struct {
-	server *MockCoAPServer
+	server *MockCoAPServer // Reference to the main server instance for accessing shared state.
 }
 
 // HandleRequest processes GET requests. It supports regular GET and observe registration.
 // It checks if the resource exists, if it's observable (for observe requests),
-// and sends the appropriate response including CoAP options like Observe and ETag (if defined).
+// and sends the appropriate response including CoAP options like Observe and ETag (if defined on the MockResource).
 // It also incorporates any configured ResponseDelay or ResponseSequence for the resource.
 func (h *GetHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path string) {
-	h.server.mu.Lock() // Use full lock to safely access and update resource.currentResponseIndex
+	h.server.mu.Lock() // Lock to safely access and potentially update resource.currentResponseIndex.
 	resource, exists := h.server.resources[path]
 
-	responseCode := codes.Content // Default success code for GET
+	responseCode := codes.Content // Default success code for GET.
 	var responsePayload []byte    // Store raw payload bytes
 	var responseOptions []message.Option
 	var responseContentType message.MediaType
@@ -390,186 +529,254 @@ func (h *GetHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path st
 			}
 		} else {
 			// Resource is not observable
-			if err := w.SetResponse(codes.NotAcceptable, message.TextPlain, []byte("Resource not observable")); err != nil {
+		if err := w.SetResponse(codes.NotAcceptable, message.TextPlain, bytes.NewReader([]byte("Resource not observable"))); err != nil {
 				fmt.Printf("MockCoAPServer ERROR: [GET %s] Failed to set NotAcceptable response for non-observable resource: %v\n", path, err)
 			}
 		}
 	} else { // Regular GET or GET for already observing client (no observe option in this request)
+		// For regular GET, payload is resource.Data.
 		h.server.setResponseWithOptions(w, responseCode, responseContentType, responsePayload, responseOptions, path)
 	}
 }
 
-// setResponseWithOptions is a helper to set response code, content type, payload, and additional CoAP options.
-// It centralizes response sending logic and error logging.
+// setResponseWithOptions is a helper utility to set the response code, content type, payload,
+// and any additional CoAP options (like ETag or Max-Age from MockResource.ServeWithOptions)
+// on the ResponseWriter. It centralizes response sending logic and includes error logging.
 // The 'requestPathForLogging' parameter provides context for log messages.
+// Payload should be a byte slice; it will be wrapped in an io.Reader internally if needed by SetResponse.
 func (m *MockCoAPServer) setResponseWithOptions(w mux.ResponseWriter, code codes.Code, ct message.MediaType, payload []byte, opts []message.Option, requestPathForLogging string) {
 	rw, ok := w.(responseWriterWithOptions)
 	if !ok {
-		fmt.Printf("MockCoAPServer WARNING: [Response %s] ResponseWriter does not implement SetOptionBytes. Cannot set custom CoAP options.\n", requestPathForLogging)
-		if err := w.SetResponse(code, ct, payload); err != nil {
+		// If the ResponseWriter doesn't support setting options directly, log a warning and send a basic response.
+		fmt.Printf("MockCoAPServer WARNING: [Response %s] ResponseWriter does not implement SetOptionBytes. Cannot set custom CoAP options from ServeWithOptions.\n", requestPathForLogging)
+		// For plgd-dev/go-coap, SetResponse takes an io.ReadSeeker for the payload.
+		var payloadReader io.ReadSeeker
+		if payload != nil {
+			payloadReader = bytes.NewReader(payload)
+		}
+		if err := w.SetResponse(code, ct, payloadReader); err != nil {
 			fmt.Printf("MockCoAPServer ERROR: [Response %s] Failed to set basic response (code %v) after SetOptionBytes incompatibility: %v\n", requestPathForLogging, code, err)
 		}
 		return
 	}
 
-	if err := rw.SetResponse(code, ct, payload); err != nil {
-		fmt.Printf("MockCoAPServer ERROR: [Response %s] Failed to set response (code %v): %v\n", requestPathForLogging, code, err)
+	// For plgd-dev/go-coap, SetResponse takes an io.ReadSeeker for the payload.
+	var payloadReader io.ReadSeeker
+	if payload != nil {
+		payloadReader = bytes.NewReader(payload)
 	}
+	if err := rw.SetResponse(code, ct, payloadReader); err != nil {
+		fmt.Printf("MockCoAPServer ERROR: [Response %s] Failed to set response (code %v): %v\n", requestPathForLogging, code, err)
+		// Even if SetResponse fails, attempt to set options if they are critical (e.g. Observe for notifications)
+		// For general options from ServeWithOptions, this might be less critical.
+	}
+
+	// Set any additional options specified (e.g., in MockResource.ServeWithOptions).
 	for _, opt := range opts {
-		if err := w.SetOptionBytes(opt.ID, opt.Value); err != nil {
-			// Non-critical options might fail, so log as warning.
-			fmt.Printf("MockCoAPServer WARNING: [Response %s] Failed to set option (ID %v): %v\n", requestPathForLogging, opt.ID, err)
+		if err := rw.SetOptionBytes(opt.ID, opt.Value); err != nil {
+			// Non-critical options might fail (e.g., client doesn't support an option), so log as warning.
+			fmt.Printf("MockCoAPServer WARNING: [Response %s] Failed to set option (ID %v, Value %x): %v\n", requestPathForLogging, opt.ID, opt.Value, err)
 		}
 	}
 }
 
 // logCoAPRequest captures details of an incoming CoAP request and stores it in the requestHistory.
-// It performs deep copies of mutable data (options, payload, token) to ensure immutability.
-// It also attempts to reset the request body reader if it's an io.ReadSeeker,
-// allowing handlers to read the body after it has been logged.
+// It performs deep copies of mutable data structures within the request (Options, Payload, Token)
+// to ensure that the logged information is immutable and safe from modifications by subsequent processing
+// or by the original sender. This is crucial for reliable test assertions based on request history.
+//
+// The method also attempts to reset the request body reader if it's an io.ReadSeeker. This allows
+// the actual CoAP handlers to read the body after it has been read and logged here. If the body
+// cannot be reset, a warning is logged, as handlers might not be able to access the payload.
 func (m *MockCoAPServer) logCoAPRequest(path string, req *pool.Message) {
-	m.mu.Lock() // Lock to protect shared resources: lastReceivedOptions, lastReceivedMessages, requestHistory
+	m.mu.Lock() // Lock to protect shared resources: lastReceivedOptions, lastReceivedMessages, requestHistory.
 	defer m.mu.Unlock()
 
-	// Deep copy CoAP options. Values within options are byte slices and need copying.
+	// Deep copy CoAP options: message.Options is a slice of message.Option.
+	// Each message.Option contains a Value ([]byte) which must be copied.
+	// This ensures that modifications to option values elsewhere do not affect the logged request.
 	reqMsgOpts := req.Options()
 	optsCopy := make(message.Options, 0, len(reqMsgOpts))
 	for _, o := range reqMsgOpts {
 		valueCopy := make([]byte, len(o.Value))
-		copy(valueCopy, o.Value)
+		copy(valueCopy, o.Value) // Deep copy of the option's value.
 		optsCopy = append(optsCopy, message.Option{ID: o.ID, Value: valueCopy})
 	}
-	m.lastReceivedOptions[path] = optsCopy // Preserve for now
+	m.lastReceivedOptions[path] = optsCopy // DEPRECATED: Retained for now.
 
-	// Read and copy the request body.
+	// Read and deep copy the request body. io.ReadAll creates a new []byte slice,
+	// effectively making a deep copy of the payload data.
 	var bodyData []byte
 	if bodyIOReader := req.Body(); bodyIOReader != nil {
 		var errReadBody error
-		bodyData, errReadBody = io.ReadAll(bodyIOReader)
+		bodyData, errReadBody = io.ReadAll(bodyIOReader) // bodyData is a new slice, effectively a deep copy.
 		if errReadBody != nil {
-			fmt.Printf("MockCoAPServer ERROR: [LogRequest %s] Failed to read request body: %v\n", path, errReadBody)
+			fmt.Printf("MockCoAPServer ERROR: [LogRequest %s] Failed to read request body for logging: %v\n", path, errReadBody)
+			// bodyData will be nil or partially read; this is acceptable for logging the attempt.
 		}
 
-		// Attempt to reset body reader if it's an io.ReadSeeker. This is crucial for handlers.
+		// Attempt to reset the body reader if it's an io.ReadSeeker. This is crucial for subsequent handlers
+		// to be able to read the body as well. If the body was read by io.ReadAll, the original reader is now at EOF.
 		if seeker, ok := bodyIOReader.(io.ReadSeeker); ok {
 			if _, errSeek := seeker.Seek(0, io.SeekStart); errSeek != nil {
-				// This is an error because subsequent handlers might fail to read the body.
-				fmt.Printf("MockCoAPServer ERROR: [LogRequest %s] Failed to seek request body reader to start: %v. Subsequent handlers may fail.\n", path, errSeek)
+				// This is a significant issue as subsequent handlers might fail to read the body.
+				fmt.Printf("MockCoAPServer ERROR: [LogRequest %s] Failed to seek request body reader to start after reading for logging: %v. Subsequent CoAP handlers may fail to read payload.\n", path, errSeek)
 			}
 		} else {
-			fmt.Printf("MockCoAPServer WARNING: [LogRequest %s] Request body is not an io.ReadSeeker (type %T). Handlers may not be able to re-read body.\n", path, bodyIOReader)
+			// If not a ReadSeeker, the body has been consumed by logging, and handlers cannot re-read it.
+			// This might be acceptable for some tests but can lead to unexpected behavior if handlers expect to read the body.
+			fmt.Printf("MockCoAPServer WARNING: [LogRequest %s] Request body is not an io.ReadSeeker (type %T). Body was consumed by logging; CoAP handlers may not be able to re-read payload.\n", path, bodyIOReader)
 		}
 	}
 
-	// Deep copy token.
+	// Deep copy token: message.Token is a []byte.
+	// This ensures that modifications to the token elsewhere do not affect the logged request.
 	tokenBytes := req.Token()
 	tokenCopy := make(message.Token, len(tokenBytes))
-	copy(tokenCopy, tokenBytes)
+	copy(tokenCopy, tokenBytes) // Deep copy of the token.
 
-	// Create and store the LoggedRequest.
+	// Create and store the LoggedRequest. All fields containing mutable data (Token, Options, Payload)
+	// are now populated with deep copies.
 	loggedReq := LoggedRequest{
-		Timestamp: time.Now().UTC(), // Use UTC for consistency
+		Timestamp: time.Now().UTC(), // Use UTC for consistency.
 		Path:      path,
 		Code:      req.Code(),
-		Token:     tokenCopy,
+		Token:     tokenCopy,    // Deep-copied token.
 		Type:      req.Type(),
-		Options:   optsCopy,
-		Payload:   bodyData, // Already copied
+		Options:   optsCopy,     // Deep-copied options.
+		Payload:   bodyData,     // Deep-copied payload.
 	}
 	m.requestHistory = append(m.requestHistory, loggedReq)
+
 	// Optional: Implement history trimming if it grows too large (e.g., keep last N requests).
+	// Example:
+	// const MAX_REQUEST_HISTORY_SIZE = 200 // Define a reasonable maximum.
 	// if len(m.requestHistory) > MAX_REQUEST_HISTORY_SIZE {
-	// 	m.requestHistory = m.requestHistory[len(m.requestHistory)-MAX_REQUEST_HISTORY_SIZE:]
+	//   m.requestHistory = m.requestHistory[len(m.requestHistory)-MAX_REQUEST_HISTORY_SIZE:]
 	// }
 
-	// Update lastReceivedMessages (consider phasing out in favor of requestHistory).
-	// The payload here is already a copy (bodyData).
-	// The main concern with req.Body() being an io.ReadSeeker was for the handlers, which is addressed by the Seek call.
-	m.lastReceivedMessages[path] = &message.Message{
+	// Update lastReceivedMessages (DEPRECATED: consider phasing out in favor of requestHistory).
+	// The payload here (bodyData) is already a deep copy.
+	// The main concern with req.Body() being an io.ReadSeeker was for the handlers, which is addressed by the Seek call attempt.
+	m.lastReceivedMessages[path] = &message.Message{ // This structure is part of the public API via GetLastReceivedMessage.
 		Code:    req.Code(),
-		Token:   tokenCopy, // Use the same copied token
+		Token:   tokenCopy, // Use the same deep-copied token.
 		Type:    req.Type(),
-		Options: optsCopy,  // Use the same copied options
-		Payload: bodyData,  // Use the copied payload
+		Options: optsCopy,  // Use the same deep-copied options.
+		Payload: bodyData,  // Use the deep-copied payload.
 	}
 }
 
-// PostHandler implements RequestHandler for POST requests.
+// PostHandler implements RequestHandler for CoAP POST requests.
+// It typically handles resource creation or updates. This implementation creates the resource
+// if it doesn't exist, or updates it if it does. It updates the resource's data, content type,
+// and last modified time. If the resource is observable, it triggers notifications.
+// ResponseDelay and ResponseSequence from the MockResource are also respected.
 type PostHandler struct {
-	server *MockCoAPServer
+	server *MockCoAPServer // Reference to the main server instance.
 }
 
 // HandleRequest processes POST requests. It's typically used for creating a new resource
 // or updating an existing one. This implementation creates the resource if it doesn't exist.
-// It updates the resource's data, content type, and last modified time.
-// If the resource is observable, it triggers notifications.
+// It updates the resource's data, content type (from request's ContentFormat option), and last modified time.
+// If the resource is observable, this will trigger notifications via UpdateResource.
 // It also incorporates any configured ResponseDelay or ResponseSequence for the resource.
 func (h *PostHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path string) {
-	h.server.mu.Lock() // Lock for modifying resources map and resource fields
+	h.server.mu.Lock() // Lock for modifying resources map and resource fields.
 	reqOpts := r.Options()
-	optsCopy := make([]message.Option, 0, len(reqOpts)) // Deep copy options
+	// Deep copy options received with the POST request to store on the resource.
+	optsCopy := make([]message.Option, 0, len(reqOpts))
 	for _, opt := range reqOpts {
-		optsCopy = append(optsCopy, message.Option{ID: opt.ID, Value: append([]byte(nil), opt.Value...)})
+		valueCopy := make([]byte, len(opt.Value))
+		copy(valueCopy, opt.Value)
+		optsCopy = append(optsCopy, message.Option{ID: opt.ID, Value: valueCopy})
 	}
 
 	resource, exists := h.server.resources[path]
 	if !exists {
-		resource = &MockResource{Path: path, Observable: false} // Default to not observable for POST-created
+		// If resource doesn't exist, create a new one. By default, POST-created resources are not observable
+		// unless explicitly made so later via AddResource or direct manipulation for testing.
+		resource = &MockResource{Path: path, Observable: false}
 		h.server.resources[path] = resource
 	}
-	resource.LastPutOrPostOptions = optsCopy // Store received options on the resource
+	resource.LastPutOrPostOptions = optsCopy // Store deep-copied received options on the resource.
 
-	// Handle ResponseDelay and ResponseSequence
-	responseCode := codes.Created // Default for POST
+	// Determine response code, applying ResponseDelay and ResponseSequence.
+	responseCode := codes.Created // Default for POST success (resource created or updated).
+	// Per RFC 7252, POST can also result in 2.04 (Changed) if the resource already existed and was updated.
+	// Here, we simplify to 2.01 (Created) for both creation and update via POST,
+	// unless overridden by ResponseSequence.
 	if resource.ResponseDelay > 0 {
 		time.Sleep(resource.ResponseDelay)
 	}
 	if len(resource.ResponseSequence) > 0 {
+		// Override default responseCode if a sequence is defined for this resource.
 		responseCode = resource.ResponseSequence[resource.currentResponseIndex]
 		resource.currentResponseIndex = (resource.currentResponseIndex + 1) % len(resource.ResponseSequence)
 	}
-	// Note: For POST, if resource didn't exist, it's created above.
-	// The ResponseSequence and ResponseDelay are applied based on the resource state *after* potential creation.
-	h.server.mu.Unlock() // Unlock after accessing/modifying resource state
+	h.server.mu.Unlock() // Unlock after initial resource access/creation and response logic setup.
 
-	// Payload processing
-	data, err := io.ReadAll(r.Body()) // Read payload from mux.Message's Body
+	// Payload processing. This should be done after the lock for initial resource setup is released,
+	// as payload reading can be an I/O operation.
+	data, err := io.ReadAll(r.Body()) // Read payload from mux.Message's Body.
 	if err != nil {
 		fmt.Printf("MockCoAPServer ERROR: [POST %s] Failed to read request payload: %v\n", path, err)
-		if errResp := w.SetResponse(codes.InternalServerError, message.TextPlain, []byte("Failed to read payload")); errResp != nil {
+		// Use bytes.NewReader for consistent payload handling in SetResponse.
+		if errResp := w.SetResponse(codes.InternalServerError, message.TextPlain, bytes.NewReader([]byte("Failed to read payload"))); errResp != nil {
 			fmt.Printf("MockCoAPServer ERROR: [POST %s] Failed to set InternalServerError response after payload read error: %v\n", path, errResp)
 		}
 		return
 	}
 
-	contentType := message.AppOctets // Default content type
+	// Determine content type from request options.
+	contentType := message.AppOctets // Default content type if not specified.
 	if cf, errCf := r.Options().GetUint32(message.ContentFormat); errCf == nil {
 		contentType = message.MediaType(cf)
 	}
 
-	// Lock again to update resource fields
+	// Lock again to update resource fields with new data and content type.
 	h.server.mu.Lock()
-	resource.Data = data
-	resource.ContentType = contentType
-	resource.LastModified = time.Now()
-	isObservable := resource.Observable // Capture before unlocking if UpdateResource is called outside lock
-	h.server.mu.Unlock()
-
-	if isObservable {
-		// UpdateResource handles its own locking and observer notifications.
-		if errUpd := h.server.UpdateResource(path, data); errUpd != nil {
-			// This is a warning because the primary POST operation (resource creation/update) likely succeeded before this.
-			// However, observers might not be notified correctly.
-			fmt.Printf("MockCoAPServer WARNING: [POST %s] Failed to UpdateResource for observation: %v. Client may not receive observation updates.\n", path, errUpd)
+	// Re-fetch resource in case it was modified between locks (though unlikely for POST to same path by same handler).
+	// More relevant if other goroutines could modify resources. For simplicity, assume `resource` pointer is still valid.
+	if res, ok := h.server.resources[path]; ok { // Ensure resource still exists if it was created above.
+		res.Data = data
+		res.ContentType = contentType
+		// LastModified and ObserveSeq are updated by UpdateResource if observable.
+		// If not observable, we should update LastModified here.
+		if !res.Observable {
+			res.LastModified = time.Now().UTC()
 		}
+		isObservable := res.Observable
+		h.server.mu.Unlock() // Unlock before potentially calling UpdateResource (which locks internally).
+
+		if isObservable {
+			// UpdateResource handles its own locking and observer notifications.
+			// It will update LastModified and ObserveSeq.
+			if errUpd := h.server.UpdateResource(path, data); errUpd != nil {
+				// This is a warning because the primary POST operation (resource creation/update) likely succeeded.
+				// However, observers might not be notified correctly.
+				fmt.Printf("MockCoAPServer WARNING: [POST %s] Failed to UpdateResource for observation: %v. Client may not receive observation updates.\n", path, errUpd)
+			}
+		}
+	} else {
+		// Should not happen if resource was created above and map wasn't modified externally.
+		h.server.mu.Unlock()
+		fmt.Printf("MockCoAPServer ERROR: [POST %s] Resource disappeared unexpectedly after creation. Cannot update with payload.\n", path)
+		if errResp := w.SetResponse(codes.InternalServerError, message.TextPlain, bytes.NewReader([]byte("Internal server error processing POST"))); errResp != nil {
+			fmt.Printf("MockCoAPServer ERROR: [POST %s] Failed to set InternalServerError response after resource disappearance: %v\n", path, errResp)
+		}
+		return
 	}
 
-	// Respond based on determined responseCode
-	if responseCode < codes.BadRequest { // Success codes like 2.01 Created or 2.04 Changed (if POST allows Changed)
+
+	// Respond based on determined responseCode (from ResponseSequence or default).
+	if responseCode < codes.BadRequest { // Success codes like 2.01 Created or 2.04 Changed.
+		// Payload for successful POST is often empty or a representation of the new resource/status.
+		// For simplicity, send empty payload for success.
 		if errSetResp := w.SetResponse(responseCode, message.TextPlain, nil); errSetResp != nil {
 			fmt.Printf("MockCoAPServer ERROR: [POST %s] Failed to set %s response: %v\n", path, responseCode, errSetResp)
 		}
-	} else { // Error codes
+	} else { // Error codes determined by ResponseSequence.
 		errorPayload := []byte(fmt.Sprintf("POST failed with server configured error: %s", responseCode.String()))
 		if errSetResp := w.SetResponse(responseCode, message.TextPlain, bytes.NewReader(errorPayload)); errSetResp != nil {
 			fmt.Printf("MockCoAPServer ERROR: [POST %s] Failed to set %s error response: %v\n", path, responseCode, errSetResp)
@@ -577,82 +784,108 @@ func (h *PostHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path s
 	}
 }
 
-// PutHandler implements RequestHandler for PUT requests.
+// PutHandler implements RequestHandler for CoAP PUT requests.
+// It's used for creating a resource at a specific URI or replacing/updating an existing one.
+// This implementation creates the resource if it doesn't exist or updates it if it's present.
+// It updates data, content type (from request's ContentFormat), and potentially triggers observe notifications.
+// ResponseDelay and ResponseSequence from the MockResource are respected.
 type PutHandler struct {
-	server *MockCoAPServer
+	server *MockCoAPServer // Reference to the main server instance.
 }
 
 // HandleRequest processes PUT requests. It's used for creating a resource at a specific URI
 // or replacing an existing one. This implementation creates if not exist or updates if present.
-// It updates data, content type, and potentially triggers observe notifications.
+// It updates data, content type (from ContentFormat option), and potentially triggers observe notifications
+// if the resource is observable.
 // It also incorporates any configured ResponseDelay or ResponseSequence for the resource.
 func (h *PutHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path string) {
-	h.server.mu.Lock() // Lock for resource map and fields
+	h.server.mu.Lock() // Lock for resource map and fields.
 	reqOpts := r.Options()
-	optsCopy := make([]message.Option, 0, len(reqOpts)) // Deep copy options
+	// Deep copy options received with the PUT request.
+	optsCopy := make([]message.Option, 0, len(reqOpts))
 	for _, opt := range reqOpts {
-		optsCopy = append(optsCopy, message.Option{ID: opt.ID, Value: append([]byte(nil), opt.Value...)})
+		valueCopy := make([]byte, len(opt.Value))
+		copy(valueCopy, opt.Value)
+		optsCopy = append(optsCopy, message.Option{ID: opt.ID, Value: valueCopy})
 	}
 
 	resource, exists := h.server.resources[path]
-	created := !exists
+	created := !exists // Will be true if resource is created by this PUT.
 	if !exists {
-		resource = &MockResource{Path: path, Observable: false} // Default to not observable
+		// If resource doesn't exist, create a new one. By default, PUT-created resources are not observable
+		// unless explicitly made so later.
+		resource = &MockResource{Path: path, Observable: false}
 		h.server.resources[path] = resource
 	}
-	resource.LastPutOrPostOptions = optsCopy
+	resource.LastPutOrPostOptions = optsCopy // Store deep-copied received options.
 
-	responseCode := codes.Changed // Default for PUT update
+	// Determine response code, applying ResponseDelay and ResponseSequence.
+	responseCode := codes.Changed // Default for PUT update (resource existed).
 	if created {
-		responseCode = codes.Created // Default for PUT create
+		responseCode = codes.Created // Default for PUT create (resource did not exist).
 	}
 
 	if resource.ResponseDelay > 0 {
 		time.Sleep(resource.ResponseDelay)
 	}
 	if len(resource.ResponseSequence) > 0 {
+		// Override default responseCode if a sequence is defined.
 		responseCode = resource.ResponseSequence[resource.currentResponseIndex]
 		resource.currentResponseIndex = (resource.currentResponseIndex + 1) % len(resource.ResponseSequence)
 	}
-	h.server.mu.Unlock() // Unlock after accessing/modifying resource state
+	h.server.mu.Unlock() // Unlock after initial resource access/creation and response logic setup.
 
-	data, err := io.ReadAll(r.Body()) // Read payload from mux.Message's Body
+	// Payload processing - similar to POST handler.
+	data, err := io.ReadAll(r.Body()) // Read payload from mux.Message's Body.
 	if err != nil {
 		fmt.Printf("MockCoAPServer ERROR: [PUT %s] Failed to read request payload: %v\n", path, err)
-		if errResp := w.SetResponse(codes.InternalServerError, message.TextPlain, []byte("Failed to read payload")); errResp != nil {
+		if errResp := w.SetResponse(codes.InternalServerError, message.TextPlain, bytes.NewReader([]byte("Failed to read payload"))); errResp != nil {
 			fmt.Printf("MockCoAPServer ERROR: [PUT %s] Failed to set InternalServerError response after payload read error: %v\n", path, errResp)
 		}
 		return
 	}
 
-	contentType := message.AppOctets // Default if not specified
+	// Determine content type from request options.
+	contentType := message.AppOctets // Default content type if not specified.
 	if cf, errCf := r.Options().GetUint32(message.ContentFormat); errCf == nil {
 		contentType = message.MediaType(cf)
 	}
 
-	// UpdateResource will handle locking for resource data update and notifications.
-	// We pass the new content type to be set by UpdateResource if we modify it to accept it,
-	// or set it directly on the resource before calling UpdateResource.
-	// For now, UpdateResource only takes data. So, lock and update here.
+	// Update resource state. This needs locking.
+	// UpdateResource handles its own locking for data update and notifications.
+	// However, we need to set ContentType here if it's derived from the PUT request.
+	// If UpdateResource were enhanced to take contentType, that would be cleaner.
 	h.server.mu.Lock()
-	resource.Data = data
-	resource.ContentType = contentType
-	// LastModified is updated by UpdateResource
-	h.server.mu.Unlock()
+	// Re-fetch resource to ensure it's still valid.
+	if res, ok := h.server.resources[path]; ok {
+		res.ContentType = contentType // Set content type from PUT request.
+		// Data update and observable notifications are handled by UpdateResource.
+		// If not observable, LastModified should be updated here or by UpdateResource (currently UpdateResource updates it).
+		h.server.mu.Unlock() // Unlock before calling UpdateResource.
 
-	if errUpd := h.server.UpdateResource(path, data /* TODO: consider passing newOpts like contentType here if UpdateResource is enhanced */); errUpd != nil {
-		// Similar to POST, this is a warning as the PUT operation itself might have logically succeeded.
-		fmt.Printf("MockCoAPServer WARNING: [PUT %s] Failed to UpdateResource for observation: %v. Client may not receive observation updates.\n", path, errUpd)
-		// If UpdateResource itself had a critical error (e.g., resource disappeared), then this might be an ERROR.
-		// For now, assume UpdateResource's error is about notifications.
+		if errUpd := h.server.UpdateResource(path, data /* newOpts for resource.ServeWithOptions could be passed here */); errUpd != nil {
+			// This could be a warning if the PUT operation itself logically succeeded (resource created/data set)
+			// but observation notification failed. Or an error if UpdateResource failed critically.
+			fmt.Printf("MockCoAPServer WARNING: [PUT %s] UpdateResource call failed or had issues: %v. Client may not receive observation updates or resource state might be inconsistent.\n", path, errUpd)
+			// Depending on UpdateResource's error semantics, might need to adjust responseCode here.
+			// For now, assume responseCode determined earlier still applies unless UpdateResource indicates total failure.
+		}
+	} else {
+		h.server.mu.Unlock()
+		fmt.Printf("MockCoAPServer ERROR: [PUT %s] Resource disappeared unexpectedly. Cannot update with payload.\n", path)
+		if errResp := w.SetResponse(codes.InternalServerError, message.TextPlain, bytes.NewReader([]byte("Internal server error processing PUT"))); errResp != nil {
+			fmt.Printf("MockCoAPServer ERROR: [PUT %s] Failed to set InternalServerError response after resource disappearance: %v\n", path, errResp)
+		}
+		return
 	}
 
-	// Respond based on determined responseCode
-	if responseCode < codes.BadRequest { // Success codes
+	// Respond based on determined responseCode.
+	if responseCode < codes.BadRequest { // Success codes (Created, Changed).
+		// Successful PUT responses usually have no payload.
 		if errSetResp := w.SetResponse(responseCode, message.TextPlain, nil); errSetResp != nil {
 			fmt.Printf("MockCoAPServer ERROR: [PUT %s] Failed to set %s response: %v\n", path, responseCode, errSetResp)
 		}
-	} else { // Error codes
+	} else { // Error codes (e.g., from ResponseSequence).
 		errorPayload := []byte(fmt.Sprintf("PUT failed with server configured error: %s", responseCode.String()))
 		if errSetResp := w.SetResponse(responseCode, message.TextPlain, bytes.NewReader(errorPayload)); errSetResp != nil {
 			fmt.Printf("MockCoAPServer ERROR: [PUT %s] Failed to set %s error response: %v\n", path, responseCode, errSetResp)
@@ -660,20 +893,24 @@ func (h *PutHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path st
 	}
 }
 
-// DeleteHandler implements RequestHandler for DELETE requests.
+// DeleteHandler implements RequestHandler for CoAP DELETE requests.
+// It removes the specified resource from the server and also removes any associated observers for that path.
+// ResponseDelay and ResponseSequence from the MockResource are respected.
 type DeleteHandler struct {
-	server *MockCoAPServer
+	server *MockCoAPServer // Reference to the main server instance.
 }
 
 // HandleRequest processes DELETE requests. It removes the specified resource and any associated observers.
-// It also incorporates any configured ResponseDelay or ResponseSequence for the resource.
+// It also incorporates any configured ResponseDelay or ResponseSequence for the resource
+// to determine the final response code (e.g., simulating delayed deletion or error conditions).
 func (h *DeleteHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path string) {
-	h.server.mu.Lock() // Lock for modifying resources and observers maps
+	h.server.mu.Lock() // Lock for modifying resources and observers maps.
 
 	resource, exists := h.server.resources[path]
-	responseCode := codes.Deleted // Default for successful DELETE
+	responseCode := codes.Deleted // Default for successful DELETE.
 
 	if exists {
+		// Apply ResponseDelay and ResponseSequence if the resource exists.
 		if resource.ResponseDelay > 0 {
 			time.Sleep(resource.ResponseDelay)
 		}
@@ -682,26 +919,33 @@ func (h *DeleteHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path
 			resource.currentResponseIndex = (resource.currentResponseIndex + 1) % len(resource.ResponseSequence)
 		}
 	} else {
+		// If resource does not exist, the response is NotFound.
+		// ResponseDelay/Sequence from a non-existent resource are not applicable.
 		responseCode = codes.NotFound
 	}
 
-	if responseCode == codes.Deleted { // Only delete if the effective code is Deleted
+	// Perform deletion only if the effective responseCode (after considering ResponseSequence) is Deleted.
+	// This allows simulating scenarios where a DELETE might be requested but results in an error due to server policy.
+	if responseCode == codes.Deleted {
 		delete(h.server.resources, path)
-		delete(h.server.observers, path) // Also remove any observers for this path
+		delete(h.server.observers, path) // Also remove any observers for this path.
 	}
 	h.server.mu.Unlock()
 
 
-	// Respond based on determined responseCode
-	var responsePayloadReader io.ReadSeeker // Payload is typically empty for DELETE success/notfound
-	responseContentType := message.TextPlain // Content type for error payloads (if any)
+	// Respond based on the determined responseCode.
+	// Payload is typically empty for DELETE success or NotFound.
+	// For other errors (from ResponseSequence), a descriptive payload might be included.
+	var responsePayloadReader io.ReadSeeker
+	responseContentType := message.TextPlain // Default content type for error payloads.
 
 	if responseCode == codes.NotFound {
 		responsePayloadReader = bytes.NewReader([]byte("Resource not found"))
-	} else if responseCode >= codes.BadRequest { // Other errors
-		responsePayloadReader = bytes.NewReader([]byte(fmt.Sprintf("DELETE failed with server configured error: %s", responseCode.String())))
+	} else if responseCode >= codes.BadRequest && responseCode != codes.Deleted { // Other errors (excluding successful Deleted)
+		// Provide a generic error payload if one is configured via ResponseSequence.
+		responsePayloadReader = bytes.NewReader([]byte(fmt.Sprintf("DELETE operation resulted in error: %s", responseCode.String())))
 	}
-
+	// For codes.Deleted, responsePayloadReader remains nil (no body).
 
 	if err := w.SetResponse(responseCode, responseContentType, responsePayloadReader); err != nil {
 		fmt.Printf("MockCoAPServer ERROR: [DELETE %s] Failed to set %s response: %v\n", path, responseCode, err)
@@ -709,89 +953,115 @@ func (h *DeleteHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path
 }
 
 // addObserver adds a new observer for a given resource path and token.
-// It acquires a lock on the server's mutex to safely modify the observers map.
+// It acquires a lock on the server's mutex to safely modify the `observers` map.
+// The observer's ResponseWriter (captured from the initial GET request) is stored
+// to send future notifications. The token is deep-copied for immutability.
 func (m *MockCoAPServer) addObserver(path string, token message.Token, w mux.ResponseWriter) {
 	m.mu.Lock() // Ensures thread-safe modification of the m.observers map.
 	defer m.mu.Unlock()
 
-	// Copy token to ensure immutability if the original token byte slice is modified elsewhere.
+	// Deep copy token to ensure immutability, as the original token byte slice
+	// from the request might be reused or modified elsewhere.
 	tokenCopy := make(message.Token, len(token))
 	copy(tokenCopy, token)
 
 	obs := Observer{
 		Token:    tokenCopy,
-		Response: w, // ResponseWriter is an interface, passed by value.
-		Active:   true,
+		Response: w,    // ResponseWriter is an interface, typically a pointer type, passed by value.
+		Active:   true, // New observers are initially active.
 	}
 	m.observers[path] = append(m.observers[path], obs)
-	// fmt.Printf("MockCoAPServer: [%s] Observer added with token %x. Total observers: %d\n", path, tokenCopy, len(m.observers[path]))
+	// fmt.Printf("MockCoAPServer DEBUG: [AddObserver %s] Observer added with token %x. Total observers for path: %d\n", path, tokenCopy, len(m.observers[path]))
 }
 
 // sendObserveNotification sends an observe notification to a specific observer.
-// It constructs the notification message with the current resource state and Observe option.
-// This function is called concurrently for each active observer when a resource is updated.
+// It constructs the notification message with the current resource state (data, content type)
+// and includes the Observe option with the updated sequence number from the resource.
+// This function is typically called concurrently for each active observer when an observed resource is updated.
 //
-// Important considerations:
-// - Observer state: Checks if the observer is active before sending.
-// - ResponseWriter: Uses the ResponseWriter captured during the initial observe request.
-// - Error Handling: If sending a notification fails (e.g., setting Observe option), the observer is marked inactive.
+// Key operational aspects:
+//   - Activity Check: Verifies if the observer is still marked `Active` before attempting to send.
+//     If not active, the function returns early, preventing further processing for this observer.
+//   - ResponseWriter Usage: Utilizes the `ResponseWriter` captured during the observer's initial registration (GET request).
+//     This writer is the dedicated channel for sending notifications back to that specific observer.
+//   - Error Handling and Deactivation: If sending the notification fails at critical stages
+//     (e.g., the ResponseWriter doesn't support setting necessary CoAP options, or setting the Observe option itself fails),
+//     the observer is marked as inactive (`Active = false`). This prevents further attempts to send notifications
+//     to a non-responsive or incorrectly configured observer, thus maintaining a clean list of active observers.
+//     Error messages are logged with `MockCoAPServer ERROR:` prefix for such critical failures.
 func (m *MockCoAPServer) sendObserveNotification(observer *Observer, resource *MockResource) {
+	// Do not attempt to send to an observer that has already been marked as inactive.
 	if !observer.Active {
 		// fmt.Printf("MockCoAPServer DEBUG: [Notify %s] Observer with token %x is inactive. Skipping notification.\n", resource.Path, observer.Token)
 		return
 	}
 
 	// The ResponseWriter (observer.Response) for an observer is the one from its initial GET request.
-	// We use this writer to send subsequent notifications.
-	// The underlying go-coap library's ResponseWriter should handle cases where the client connection
-	// might have been closed, typically by returning an error on write attempts.
+	// This writer is used to send subsequent notifications.
+	// The underlying go-coap library's ResponseWriter should handle errors if the client connection
+	// has been closed (e.g., by returning an error on write attempts), which would then be caught here.
 
-	// Set standard response fields for the notification.
-	// Note: ServeWithOptions are from the resource, not the original request.
-	// Pass resource.Path for logging context in setResponseWithOptions.
+	// Set standard response fields for the notification (Content code, ContentType, Payload).
+	// ServeWithOptions from the resource (e.g., ETag) are also applied to the notification.
+	// resource.Path is passed for logging context within setResponseWithOptions.
+	// resource.Data is a direct byte slice; setResponseWithOptions will wrap it in an io.ReadSeeker as needed.
 	m.setResponseWithOptions(observer.Response, codes.Content, resource.ContentType, resource.Data, resource.ServeWithOptions, resource.Path)
 
+	// Attempt to cast ResponseWriter to responseWriterWithOptions to set the Observe option.
+	// This is necessary because the standard mux.ResponseWriter interface doesn't expose SetOptionBytes.
 	rw, ok := observer.Response.(responseWriterWithOptions)
 	if !ok {
-		// This is a critical failure for an observer, as the Observe option cannot be set.
+		// This is a critical failure for an observer, as the Observe option cannot be set,
+		// making the notification incomplete or non-compliant from the client's perspective.
+		// Deactivate the observer to prevent further malformed notifications.
 		fmt.Printf("MockCoAPServer ERROR: [Notify %s] Observer ResponseWriter (token %x) does not implement SetOptionBytes. Notification will be incomplete. Deactivating observer.\n", resource.Path, observer.Token)
-		observer.Active = false // Deactivate observer as it cannot correctly process notifications.
+		observer.Active = false // Deactivate observer due to incompatible ResponseWriter.
 		return
 	}
 
-	// Encode and set the Observe option with the current sequence number.
+	// Encode and set the Observe option with the current sequence number from the resource.
+	// This sequence number is crucial for the client to correctly order and process observation updates.
 	buf := make([]byte, 4) // Max size for uint32 CoAP Observe option encoding.
 	resultBuffer, bytesWritten := message.EncodeUint32(buf, resource.ObserveSeq)
 	obsBytes := resultBuffer[:bytesWritten]
 
 	if err := rw.SetOptionBytes(message.Observe, obsBytes); err != nil {
-		// Failure to set the Observe option is critical for the client's ability to process the notification.
-		fmt.Printf("MockCoAPServer ERROR: [Notify %s] Failed to set Observe option (seq %d, token %x): %v. Deactivating observer.\n", resource.Path, resource.ObserveSeq, observer.Token, err)
-		observer.Active = false // Deactivate observer as it's not processing notifications correctly.
+		// Failure to set the Observe option is critical for the client's ability to correctly process the notification.
+		// Deactivate the observer as it's not processing these essential parts of notifications correctly.
+		fmt.Printf("MockCoAPServer ERROR: [Notify %s] Failed to set Observe option (seq %d, token %x) on notification: %v. Deactivating observer.\n", resource.Path, resource.ObserveSeq, observer.Token, err)
+		observer.Active = false // Deactivate observer due to failure in setting Observe option.
 	} else {
 		// fmt.Printf("MockCoAPServer DEBUG: [Notify %s] Successfully sent Observe notification (seq %d, token %x).\n", resource.Path, resource.ObserveSeq, observer.Token)
 	}
 
-	// Note: The actual sending of the message over the wire is handled by the CoAP library
+	// Note on implicit error handling: The actual sending of the message over the network is handled by the CoAP library
 	// when these options and response details are set on the ResponseWriter.
-	// If ResponseWriter.SetResponse itself sends synchronously and returns an error for a closed connection,
-	// that would be the place to catch it and mark observer inactive.
-	// The plgd/go-coap library's ResponseWriter might behave this way.
+	// If ResponseWriter.SetResponse or SetOptionBytes itself returns an error (e.g., due to a closed connection),
+	// that would be an implicit way to detect a non-responsive client. The current logic deactivates observers
+	// primarily on failures to *construct* the notification correctly (missing option capabilities) or explicitly
+	// failing to set the Observe option. Connection-related errors during the actual transmission by the underlying
+	// library might not be caught here unless they propagate up through SetResponse/SetOptionBytes calls.
 }
 
 // Test utilities for assertions and inspecting server state.
-// These functions provide safe access to server internals for test verification.
+// These functions provide safe, read-only access to server internals for test verification purposes.
 
 // GetRequestHistory returns a copy of the logged CoAP requests.
 // This allows tests to inspect the sequence and details of requests received by the server.
-// The returned slice is a copy, so modifications to it will not affect the server's internal history.
+// The returned slice is a deep copy with respect to the LoggedRequest structs it contains,
+// meaning modifications to the returned slice or its elements will not affect the server's internal history.
+// Each LoggedRequest within the slice also contains deep copies of its mutable fields (Token, Options, Payload),
+// ensuring immutability of the historical data.
 func (m *MockCoAPServer) GetRequestHistory() []LoggedRequest {
 	m.mu.RLock() // Protects read access to requestHistory.
 	defer m.mu.RUnlock()
 
+	// Create a new slice and copy LoggedRequest items.
 	historyCopy := make([]LoggedRequest, len(m.requestHistory))
-	// LoggedRequest fields (Token, Options, Payload) are already deep-copied during their creation in logCoAPRequest.
-	// Therefore, a shallow copy of each LoggedRequest struct into the new slice is sufficient here.
+	// Each LoggedRequest is a struct. When copied, its fields are copied.
+	// Since Token, Options, and Payload within LoggedRequest are already deep copies
+	// (made during logCoAPRequest), a direct copy of the LoggedRequest struct
+	// effectively preserves the deep-copy characteristic for the elements in historyCopy.
 	for i, req := range m.requestHistory {
 		historyCopy[i] = req
 	}
@@ -800,24 +1070,29 @@ func (m *MockCoAPServer) GetRequestHistory() []LoggedRequest {
 
 // ClearRequestHistory removes all entries from the request history log.
 // This is useful in tests to reset the server's recorded request state, for example,
-// between distinct phases of a test or before a specific action is tested.
+// between distinct test cases or phases within a single test, ensuring that assertions
+// are made only against relevant requests.
 func (m *MockCoAPServer) ClearRequestHistory() {
 	m.mu.Lock() // Protects write access to requestHistory.
 	defer m.mu.Unlock()
-	// Reset to a new empty slice, preserving allocated capacity for efficiency if it's to be refilled.
+	// Reset to a new empty slice. The previous slice's capacity might be retained by the runtime
+	// if `cap(m.requestHistory)` was passed, which can be efficient if it's refilled soon.
 	m.requestHistory = make([]LoggedRequest, 0, cap(m.requestHistory))
 }
 
 // GetObserverCount returns the number of currently active observers for a specific resource path.
-// This can be used in tests to verify that observation registrations and de-registrations are being handled correctly.
+// This can be used in tests to verify that CoAP observation registrations and de-registrations
+// are being handled correctly by the server (e.g., observer count increases on registration,
+// decreases on de-registration or when an observer becomes inactive).
+// An observer is considered active if its `Active` flag is true.
 func (m *MockCoAPServer) GetObserverCount(path string) int {
 	m.mu.RLock() // Protects read access to the observers map.
 	defer m.mu.RUnlock()
 
 	count := 0
-	if observers, exists := m.observers[path]; exists {
-		for _, obs := range observers {
-			if obs.Active { // Only count active observers
+	if observersForPath, exists := m.observers[path]; exists {
+		for _, obs := range observersForPath {
+			if obs.Active { // Only count observers explicitly marked as active.
 				count++
 			}
 		}
@@ -825,15 +1100,16 @@ func (m *MockCoAPServer) GetObserverCount(path string) int {
 	return count
 }
 
-// GetResourceData retrieves the current data for a resource at the given path.
-// It returns a copy of the data and true if the resource exists, otherwise nil and false.
-// Returning a copy ensures that the internal state of the mock server is not inadvertently modified by tests.
+// GetResourceData retrieves the current data (payload) for a resource at the given path.
+// It returns a deep copy of the data and true if the resource exists, otherwise nil and false.
+// Returning a deep copy ensures that the internal state of the MockCoAPServer is not inadvertently
+// modified by tests if the returned byte slice is mutated by the caller.
 func (m *MockCoAPServer) GetResourceData(path string) ([]byte, bool) {
 	m.mu.RLock() // Protects read access to the resources map.
 	defer m.mu.RUnlock()
 
 	if resource, exists := m.resources[path]; exists {
-		// Return a copy of the data to prevent external modification of the internal state.
+		// Return a deep copy of the data to prevent external modification of the internal state.
 		dataCopy := make([]byte, len(resource.Data))
 		copy(dataCopy, resource.Data)
 		return dataCopy, true
@@ -842,9 +1118,13 @@ func (m *MockCoAPServer) GetResourceData(path string) ([]byte, bool) {
 }
 
 // GetLastReceivedOptionsForPath returns a deep copy of the CoAP options from the most recent request
-// received for the specified resource path.
-// Note: This is largely superseded by GetRequestHistory but retained for potential specific use cases or compatibility.
-// Returns the options and true if found, otherwise nil and false.
+// received for the specified resource path, as stored in the legacy `lastReceivedOptions` map.
+//
+// DEPRECATED: Prefer using `GetRequestHistory()` for more comprehensive request details, as it provides
+// access to all logged requests, not just the last one's options. This method is retained primarily
+// for backward compatibility or very specific, simple use cases.
+//
+// Returns the options (as a deep copy) and true if found for the path, otherwise nil and false.
 func (m *MockCoAPServer) GetLastReceivedOptionsForPath(path string) ([]message.Option, bool) {
 	m.mu.RLock() // Protects read access to lastReceivedOptions.
 	defer m.mu.RUnlock()
@@ -864,18 +1144,22 @@ func (m *MockCoAPServer) GetLastReceivedOptionsForPath(path string) ([]message.O
 	return optsCopy, true
 }
 
-// GetResourceLastPutOrPostOptions returns a deep copy of the CoAP options from the last PUT or POST request
-// specifically for a given resource path, as stored on the MockResource itself.
-// Returns the options and true if found and set, otherwise nil and false.
+// GetResourceLastPutOrPostOptions returns a deep copy of the CoAP options that were part of the
+// last PUT or POST request successfully processed for a given resource path. These options are
+// stored on the `MockResource` itself (in `MockResource.LastPutOrPostOptions`).
+// This is useful for verifying that specific options sent in a state-changing request (like custom
+// options or conditional request options such as If-Match) were correctly received and processed by the server.
+// Returns the options (as a deep copy) and true if the resource exists and options were set, otherwise nil and false.
 func (m *MockCoAPServer) GetResourceLastPutOrPostOptions(path string) ([]message.Option, bool) {
 	m.mu.RLock() // Protects read access to resources map and resource fields.
 	defer m.mu.RUnlock()
 
 	resource, exists := m.resources[path]
 	if !exists || resource.LastPutOrPostOptions == nil {
+		// Resource doesn't exist, or no PUT/POST options have been stored for it.
 		return nil, false
 	}
-	// Return a deep copy for safety.
+	// Return a deep copy for safety, as message.Option values are byte slices.
 	optsCopy := make([]message.Option, 0, len(resource.LastPutOrPostOptions))
 	for _, o := range resource.LastPutOrPostOptions {
 		valueCopy := make([]byte, len(o.Value))
@@ -887,26 +1171,31 @@ func (m *MockCoAPServer) GetResourceLastPutOrPostOptions(path string) ([]message
 
 // MockCoAPClient provides a simplified CoAP client for use in integration tests,
 // typically for interacting with a MockCoAPServer or another CoAP endpoint under test.
-// It offers basic GET, POST, PUT, and DELETE operations.
+// It offers basic GET, POST, PUT, and DELETE operations using the `plgd-dev/go-coap` library.
+//
+// Note: For complex scenarios such as CoAP observation setup, detailed option manipulation,
+// or handling of block-wise transfers, a more featured CoAP client library might be necessary,
+// or this MockCoAPClient could be extended to support those specific features.
 type MockCoAPClient struct {
 	serverAddr string       // Target server address in "host:port" format.
-	client     *client.Conn // Underlying CoAP client connection.
+	client     *client.Conn // Underlying CoAP client connection from `plgd-dev/go-coap/v3/udp/client`.
 }
 
-// NewMockCoAPClient creates a new MockCoAPClient targeting the specified server address.
-// The serverAddr should be in "host:port" format.
+// NewMockCoAPClient creates a new MockCoAPClient instance targeting the specified server address.
+// The `serverAddr` should be in "host:port" format (e.g., "127.0.0.1:5683").
 func NewMockCoAPClient(serverAddr string) *MockCoAPClient {
 	return &MockCoAPClient{
 		serverAddr: serverAddr,
 	}
 }
 
-// Connect establishes a UDP connection to the CoAP server.
-// This must be called before any CoAP operations (GET, POST, etc.).
-// The provided context can be used for timeout or cancellation of the dialing process.
+// Connect establishes a UDP connection to the CoAP server specified by `serverAddr`.
+// This method must be successfully called before any CoAP operations (GET, POST, PUT, DELETE)
+// can be performed by the client. The provided `context.Context` can be used to set a timeout
+// or enable cancellation for the dialing process. It uses `udp.Dial` from the `plgd-dev/go-coap` library.
 func (c *MockCoAPClient) Connect(ctx context.Context) error {
-	// udp.Dial is used here, which is suitable for CoAP over UDP.
-	// The context is passed via options to control the dialing process.
+	// `udp.Dial` is used for CoAP over UDP.
+	// The context is passed via `options.WithContext` to control the dialing process (e.g., for timeout).
 	conn, err := udp.Dial(c.serverAddr, options.WithContext(ctx))
 	if err != nil {
 		return fmt.Errorf("MockCoAPClient ERROR: [Connect %s] Failed to connect to server: %w", c.serverAddr, err)

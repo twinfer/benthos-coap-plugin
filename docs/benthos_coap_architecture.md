@@ -15,7 +15,8 @@ benthos-coap/
 │   ├── observer/        # CoAP observe subscription management
 │   ├── converter/       # Message format conversion
 │   ├── config/          # Configuration validation and parsing
-│   └── metrics/         # Custom metrics collection
+│   ├── metrics/         # Custom metrics collection
+│   └── testing/         # Mock CoAP server and test helpers
 ├── cmd/
 │   └── main.go         # Plugin registration and CLI
 ├── examples/
@@ -422,16 +423,35 @@ output:
 ## Testing Strategy
 
 ### Unit Tests
-- Mock CoAP server for testing
-- Connection manager test suite
-- Message conversion validation
-- Error handling verification
+- Core logic for connection management, observation handling, and message conversion is unit-tested.
+- Error handling paths are validated.
+- Configuration parsing and validation are checked.
+
+#### Mock CoAP Server (`pkg/testing/mock_server.go`)
+The `MockCoAPServer` is a crucial component for unit and integration testing of the CoAP plugins. It provides an in-memory CoAP server that can be easily configured and controlled within test environments.
+
+**Key Features:**
+- **Resource Simulation**: Allows dynamic creation and management of CoAP resources, including their content, content type, and observable behavior.
+- **Method Handling**: Supports standard CoAP methods (GET, POST, PUT, DELETE) through a configurable request handler mechanism.
+- **Observation Support**: Can simulate observable resources and send notifications when resources are updated, essential for testing the CoAP input plugin's observe functionality.
+- **Request History**: Captures all incoming requests (method, path, options, payload), enabling detailed assertions on how the plugins interact with the server.
+- **Response Control**:
+    - **Simulated Delays**: Resources can be configured with `ResponseDelay` to simulate network latency or slow server processing, useful for testing timeout configurations in plugins.
+    - **Response Sequencing**: Resources can be set up with a `ResponseSequence` of CoAP codes, allowing tests to simulate scenarios like initial server errors followed by success (e.g., for retry policy testing) or persistent error conditions.
+
+The `MockCoAPServer` was extensively used to test both the CoAP input plugin (e.g., verifying observe subscription, notification handling, and resubscription logic) and the CoAP output plugin (e.g., verifying correct message delivery, method usage, option handling, and retry behavior against simulated server responses).
 
 ### Integration Tests
-- Real CoAP server integration
-- End-to-end message flow testing
-- Security protocol validation
-- Performance benchmarking
+- Comprehensive integration tests for both the CoAP input and output plugins have been developed (`pkg/input/coap_input_integration_test.go`, `pkg/output/coap_output_integration_test.go`).
+- These tests utilize the `MockCoAPServer` to simulate real CoAP server interactions, covering scenarios such as:
+    - Basic message sending and receiving with various CoAP methods and options.
+    - Observe subscription establishment, notification delivery, and resubscription after simulated connection drops or server restarts.
+    - Plugin behavior with non-observable resources.
+    - Handling of server-induced delays and error codes to test client-side timeouts, retry policies, and error handling.
+    - Correct content format negotiation and metadata propagation.
+- End-to-end message flow testing within a Benthos pipeline context.
+- Security protocol validation (though current tests focus on "none" mode with the mock server).
+- Performance benchmarking under specific conditions.
 
 ### Load Testing
 - High-throughput observer scenarios
