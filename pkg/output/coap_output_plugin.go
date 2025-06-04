@@ -306,7 +306,7 @@ func (o *Output) WriteWithRetry(ctx context.Context, msg *service.Message, retry
 	if _, exists := msg.MetaGet("content_type"); !exists && o.config.RequestOptions.ContentFormat != "" {
 		msg.MetaSet("content_type", o.config.RequestOptions.ContentFormat)
 	}
-	
+
 	// Convert Benthos message to CoAP message
 	coapMsg, err := o.converter.MessageToCoAP(msg) // converter now uses coap_path from metadata
 	if err != nil {
@@ -574,8 +574,8 @@ func (o *Output) Close(ctx context.Context) error {
 }
 
 // Health returns the current health status of the output
-func (o *Output) Health() map[string]interface{} {
-	healthStatus := map[string]interface{}{
+func (o *Output) Health() map[string]any {
+	healthStatus := map[string]any{
 		"status":       "healthy", // Default to healthy, can be changed based on checks
 		"endpoints":    o.config.Endpoints,
 		"protocol":     o.config.Protocol,

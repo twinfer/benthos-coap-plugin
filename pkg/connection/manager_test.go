@@ -137,7 +137,7 @@ func TestManagerGetConnectionSuccess(t *testing.T) {
 	conn, err := manager.Get(ctx)
 	assert.NoError(t, err)
 	assert.NotNil(t, conn)
-	
+
 	// Clean up
 	if conn != nil {
 		manager.Put(conn)

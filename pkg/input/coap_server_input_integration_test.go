@@ -47,10 +47,10 @@ func setupCoAPServerInput(t *testing.T, confYAML string) (*ServerInput, func()) 
 // Helper to create a CoAP client for testing
 func createTestClient(t *testing.T, serverAddr string) (*client.Conn, func()) {
 	t.Helper()
-	
+
 	conn, err := udp.Dial(serverAddr, options.WithContext(context.Background()))
 	require.NoError(t, err, "Failed to create CoAP client")
-	
+
 	cleanup := func() {
 		conn.Close()
 	}
@@ -119,7 +119,7 @@ response:
 	require.NoError(t, err, "Failed to send GET request")
 	require.NotNil(t, resp)
 	assert.Equal(t, codes.Content, resp.Code(), "Response code should be Content (2.05)")
-	
+
 	// Read response body
 	respPayload, err := resp.ReadBody()
 	require.NoError(t, err)
@@ -139,7 +139,7 @@ response:
 
 	// Check message content
 	msg := receivedMessages[0]
-	
+
 	// Check metadata
 	method, exists := msg.MetaGet("coap_server_method")
 	assert.True(t, exists, "coap_server_method should exist")
@@ -263,10 +263,10 @@ buffer_size: 100
 	defer clientCleanup()
 
 	tests := []struct {
-		name           string
-		path           string
-		expectedCode   codes.Code
-		shouldReceive  bool
+		name          string
+		path          string
+		expectedCode  codes.Code
+		shouldReceive bool
 	}{
 		{
 			name:          "allowed exact path",
@@ -309,7 +309,7 @@ buffer_size: 100
 				defer wg.Done()
 				msgCtx, msgCancel := context.WithTimeout(ctx, 500*time.Millisecond)
 				defer msgCancel()
-				
+
 				msg, ackFn, err := serverInput.Read(msgCtx)
 				if err == nil && msg != nil {
 					mu.Lock()
@@ -420,7 +420,7 @@ buffer_size: 100
 			msgCtx, msgCancel := context.WithTimeout(ctx, 100*time.Millisecond)
 			msg, ackFn, err := serverInput.Read(msgCtx)
 			msgCancel()
-			
+
 			if err != nil {
 				if ctx.Err() != nil {
 					return
@@ -444,7 +444,7 @@ buffer_size: 100
 			defer clientWg.Done()
 			path := fmt.Sprintf("/client/%d", clientNum)
 			payload := fmt.Sprintf("Message from client %d", clientNum)
-			
+
 			resp, err := c.Post(ctx, path, message.TextPlain, bytes.NewReader([]byte(payload)))
 			assert.NoError(t, err, "Client %d failed to send POST", clientNum)
 			if resp != nil {
@@ -455,7 +455,7 @@ buffer_size: 100
 
 	// Wait for all clients to finish
 	clientWg.Wait()
-	
+
 	// Allow time for message processing
 	time.Sleep(200 * time.Millisecond)
 
@@ -472,7 +472,7 @@ buffer_size: 100
 	for _, msg := range receivedMessages {
 		path, _ := msg.MetaGet("coap_server_path")
 		clientPaths[path] = true
-		
+
 		// Verify message content
 		payload, err := msg.AsBytes()
 		assert.NoError(t, err)

@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
@@ -231,13 +232,7 @@ func (c *CoAPConfig) validateConverter() error {
 			"application/cbor", "application/octet-stream",
 		}
 
-		valid := false
-		for _, format := range validFormats {
-			if c.Converter.DefaultContentFormat == format {
-				valid = true
-				break
-			}
-		}
+		valid := slices.Contains(validFormats, c.Converter.DefaultContentFormat)
 
 		if !valid {
 			return fmt.Errorf("converter default_content_format must be one of: %s",

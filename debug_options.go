@@ -17,7 +17,7 @@ func main() {
 	typ := val.Type()
 
 	fmt.Printf("Methods on Options:\n")
-	for i := 0; i < typ.NumMethod(); i++ {
+	for i := range typ.NumMethod() {
 		method := typ.Method(i)
 		fmt.Printf("  %s: %v\n", method.Name, method.Type)
 	}

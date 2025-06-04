@@ -36,6 +36,7 @@ import (
 	"github.com/plgd-dev/go-coap/v3/udp"
 	"github.com/plgd-dev/go-coap/v3/udp/client"
 	"github.com/plgd-dev/go-coap/v3/udp/server"
+	"slices"
 )
 
 // RequestHandler defines the interface for handling CoAP requests.
@@ -109,11 +110,11 @@ type MockResource struct {
 	LastModified         time.Time         // Timestamp of the last modification to the resource.
 	ServeWithOptions     []message.Option  // CoAP options to be included in responses for GET requests to this resource.
 	LastPutOrPostOptions []message.Option  // CoAP options received in the last PUT or POST request to this resource.
-	
+
 	// Fields for testing scenarios
-	ResponseDelay         time.Duration // Delay before responding (for timeout tests)
-	ResponseSequence      []codes.Code  // Sequence of response codes to return
-	CurrentResponseIndex  int           // Current index in ResponseSequence
+	ResponseDelay        time.Duration // Delay before responding (for timeout tests)
+	ResponseSequence     []codes.Code  // Sequence of response codes to return
+	CurrentResponseIndex int           // Current index in ResponseSequence
 }
 
 // Observer represents an active CoAP observer client for a specific resource.
@@ -479,7 +480,7 @@ func (h *PostHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path s
 	reqOpts := r.Options()
 	optsCopy := make([]message.Option, 0, len(reqOpts)) // Deep copy options
 	for _, opt := range reqOpts {
-		optsCopy = append(optsCopy, message.Option{ID: opt.ID, Value: append([]byte(nil), opt.Value...)})
+		optsCopy = append(optsCopy, message.Option{ID: opt.ID, Value: slices.Clone(opt.Value)})
 	}
 
 	resource, exists := h.server.resources[path]
@@ -530,7 +531,7 @@ func (h *PostHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path s
 	if exists {
 		// Check for response delay
 		responseDelay = res.ResponseDelay
-		
+
 		// Check for response sequence
 		if len(res.ResponseSequence) > 0 {
 			if res.CurrentResponseIndex < len(res.ResponseSequence) {
@@ -540,7 +541,7 @@ func (h *PostHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path s
 		}
 	}
 	h.server.mu.Unlock()
-	
+
 	// Apply response delay if specified
 	if responseDelay > 0 {
 		time.Sleep(responseDelay)
@@ -564,7 +565,7 @@ func (h *PutHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path st
 	reqOpts := r.Options()
 	optsCopy := make([]message.Option, 0, len(reqOpts)) // Deep copy options
 	for _, opt := range reqOpts {
-		optsCopy = append(optsCopy, message.Option{ID: opt.ID, Value: append([]byte(nil), opt.Value...)})
+		optsCopy = append(optsCopy, message.Option{ID: opt.ID, Value: slices.Clone(opt.Value)})
 	}
 
 	resource, exists := h.server.resources[path]
@@ -618,7 +619,7 @@ func (h *PutHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path st
 	if exists {
 		// Check for response delay
 		responseDelay = res.ResponseDelay
-		
+
 		// Check for response sequence
 		if len(res.ResponseSequence) > 0 {
 			if res.CurrentResponseIndex < len(res.ResponseSequence) {
@@ -628,12 +629,12 @@ func (h *PutHandler) HandleRequest(w mux.ResponseWriter, r *mux.Message, path st
 		}
 	}
 	h.server.mu.Unlock()
-	
+
 	// Apply response delay if specified
 	if responseDelay > 0 {
 		time.Sleep(responseDelay)
 	}
-	
+
 	if errSetResp := w.SetResponse(responseCode, message.TextPlain, nil); errSetResp != nil {
 		fmt.Printf("MockCoAPServer ERROR: [PUT %s] Failed to set %s response: %v\n", path, responseCode, errSetResp)
 	}
@@ -847,12 +848,12 @@ func (m *MockCoAPServer) GetResourceLastPutOrPostOptions(path string) ([]message
 func (m *MockCoAPServer) GetResource(path string) (*MockResource, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	resource, exists := m.resources[path]
 	if !exists {
 		return nil, false
 	}
-	
+
 	// Return a copy to prevent external modification
 	resourceCopy := *resource
 	return &resourceCopy, true
@@ -863,7 +864,7 @@ func (m *MockCoAPServer) MuLock() {
 	m.mu.Lock()
 }
 
-// MuUnlock exposes the mutex for test helper functions  
+// MuUnlock exposes the mutex for test helper functions
 func (m *MockCoAPServer) MuUnlock() {
 	m.mu.Unlock()
 }
@@ -883,24 +884,24 @@ func (m *MockCoAPServer) SetResourceInternal(path string, resource *MockResource
 func (m *MockCoAPServer) SetResourceDelay(path string, delay time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	resource, exists := m.resources[path]
 	if !exists {
 		return fmt.Errorf("resource not found: %s", path)
 	}
-	
+
 	resource.ResponseDelay = delay
 	return nil
 }
 
 // SetupTestServer creates and starts a MockCoAPServer for testing
-func SetupTestServer(t interface{}) (*MockCoAPServer, func()) {
+func SetupTestServer(t any) (*MockCoAPServer, func()) {
 	server := NewMockCoAPServer()
 	err := server.Start()
 	if err != nil {
 		panic(fmt.Sprintf("Failed to start mock server: %v", err))
 	}
-	
+
 	return server, func() {
 		server.Stop()
 	}

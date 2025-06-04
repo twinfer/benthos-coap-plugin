@@ -21,7 +21,7 @@ import (
 // Helper to create and connect CoapInput, returns the input and a cleanup function.
 func setupCoapInput(t *testing.T, confYAML string) (*Input, func()) {
 	t.Helper()
-	
+
 	// Create the config spec (same as in the plugin)
 	configSpec := service.NewConfigSpec().
 		Summary("Reads messages from CoAP endpoints using observe subscriptions.").
@@ -67,7 +67,7 @@ func setupCoapInput(t *testing.T, confYAML string) (*Input, func()) {
 			service.NewBoolField("compression_enabled").Default(true),
 			service.NewIntField("max_payload_size").Default(1048576),
 			service.NewBoolField("preserve_options").Default(false)).Optional())
-			
+
 	pConf, err := configSpec.ParseYAML(confYAML, nil)
 	require.NoError(t, err, "Failed to parse CoAP input config YAML")
 
@@ -155,7 +155,7 @@ converter:
 	// the go-coap client library cannot properly handle observe notifications.
 	// We can only reliably test the initial observe subscription.
 	require.GreaterOrEqual(t, len(receivedMessages), 1, "Should receive at least the initial notification")
-	
+
 	// Test the initial message
 	initialMsgBytes, err := receivedMessages[0].AsBytes()
 	require.NoError(t, err)

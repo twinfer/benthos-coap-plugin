@@ -8,9 +8,9 @@ import (
 
 // HealthStatus represents component health
 type HealthStatus struct {
-	Healthy   bool                   `json:"healthy"`
-	Timestamp time.Time              `json:"timestamp"`
-	Details   map[string]interface{} `json:"details,omitempty"`
+	Healthy   bool           `json:"healthy"`
+	Timestamp time.Time      `json:"timestamp"`
+	Details   map[string]any `json:"details,omitempty"`
 }
 
 // HealthChecker provides health monitoring
@@ -28,24 +28,24 @@ func (h *HealthChecker) CheckHealth(ctx context.Context) *HealthStatus {
 	status := &HealthStatus{
 		Healthy:   true,
 		Timestamp: time.Now(),
-		Details:   make(map[string]interface{}),
+		Details:   make(map[string]any),
 	}
 
 	// Check connection health
 	// Note: In real implementation, would check actual metric values
-	status.Details["connections"] = map[string]interface{}{
+	status.Details["connections"] = map[string]any{
 		"active": 0, // Would get from actual metrics
 		"status": "healthy",
 	}
 
 	// Check observer health
-	status.Details["observers"] = map[string]interface{}{
+	status.Details["observers"] = map[string]any{
 		"active": 0,
 		"status": "healthy",
 	}
 
 	// Check error rates
-	status.Details["error_rate"] = map[string]interface{}{
+	status.Details["error_rate"] = map[string]any{
 		"current": 0.0,
 		"status":  "healthy",
 	}

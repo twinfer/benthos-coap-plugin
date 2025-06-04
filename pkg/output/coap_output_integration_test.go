@@ -54,7 +54,7 @@ func newCoapOutputFromConf(t *testing.T, confYaml string) *Output {
 			service.NewBoolField("compression_enabled").Default(true),
 			service.NewIntField("max_payload_size").Default(1048576),
 			service.NewBoolField("preserve_options").Default(false)).Optional())
-	
+
 	pConf, err := configSpec.ParseYAML(confYaml, nil)
 	require.NoError(t, err)
 

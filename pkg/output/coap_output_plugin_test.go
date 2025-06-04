@@ -277,7 +277,7 @@ func TestCoAPMessageCreation(t *testing.T) {
 		code    codes.Code
 		payload []byte
 		token   string
-		options map[message.OptionID]interface{}
+		options map[message.OptionID]any
 	}{
 		{
 			name:    "GET request",
@@ -290,7 +290,7 @@ func TestCoAPMessageCreation(t *testing.T) {
 			code:    codes.POST,
 			payload: []byte("sensor data"),
 			token:   "post-token",
-			options: map[message.OptionID]interface{}{
+			options: map[message.OptionID]any{
 				message.ContentFormat: message.TextPlain,
 			},
 		},
@@ -299,7 +299,7 @@ func TestCoAPMessageCreation(t *testing.T) {
 			code:    codes.PUT,
 			payload: []byte(`{"temperature": 23.5}`),
 			token:   "put-token",
-			options: map[message.OptionID]interface{}{
+			options: map[message.OptionID]any{
 				message.ContentFormat: message.AppJSON,
 			},
 		},
@@ -432,7 +432,7 @@ func calculateRetryDelay(policy RetryPolicy, attempt int) time.Duration {
 	}
 
 	delay := policy.InitialInterval
-	for i := 0; i < attempt; i++ {
+	for range attempt {
 		delay = time.Duration(float64(delay) * policy.Multiplier)
 	}
 

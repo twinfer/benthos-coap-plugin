@@ -175,9 +175,9 @@ func (cb *CircuitBreaker) State() string {
 	}
 }
 
-func (cb *CircuitBreaker) Stats() map[string]interface{} {
+func (cb *CircuitBreaker) Stats() map[string]any {
 	if !cb.config.Enabled {
-		return map[string]interface{}{
+		return map[string]any{
 			"enabled": false,
 		}
 	}
@@ -186,7 +186,7 @@ func (cb *CircuitBreaker) Stats() map[string]interface{} {
 	lastFailure := cb.lastFailureTime
 	cb.mu.RUnlock()
 
-	stats := map[string]interface{}{
+	stats := map[string]any{
 		"enabled":             true,
 		"state":               cb.State(),
 		"failures":            atomic.LoadInt32(&cb.failures),
@@ -275,11 +275,11 @@ func (cbm *CircuitBreakerManager) List() []string {
 	return names
 }
 
-func (cbm *CircuitBreakerManager) Stats() map[string]interface{} {
+func (cbm *CircuitBreakerManager) Stats() map[string]any {
 	cbm.mu.RLock()
 	defer cbm.mu.RUnlock()
 
-	stats := make(map[string]interface{})
+	stats := make(map[string]any)
 	openCount := 0
 	halfOpenCount := 0
 	closedCount := 0
@@ -300,7 +300,7 @@ func (cbm *CircuitBreakerManager) Stats() map[string]interface{} {
 		}
 	}
 
-	stats["summary"] = map[string]interface{}{
+	stats["summary"] = map[string]any{
 		"total":     len(cbm.breakers),
 		"open":      openCount,
 		"half_open": halfOpenCount,

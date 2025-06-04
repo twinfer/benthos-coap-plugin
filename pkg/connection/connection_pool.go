@@ -35,7 +35,7 @@ type PoolMetrics struct {
 }
 
 type ConnectionWrapper struct {
-	conn      interface{} // *udp.Conn, *tcp.Conn, etc.
+	conn      any // *udp.Conn, *tcp.Conn, etc.
 	endpoint  string
 	lastUsed  time.Time
 	inUse     int32
@@ -245,11 +245,11 @@ func (p *ConnectionPool) Close() error {
 	return nil
 }
 
-func (p *ConnectionPool) Stats() map[string]interface{} {
+func (p *ConnectionPool) Stats() map[string]any {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	return map[string]interface{}{
+	return map[string]any{
 		"endpoint":     p.endpoint,
 		"protocol":     p.protocol,
 		"max_size":     p.maxSize,
@@ -288,7 +288,7 @@ func (c *ConnectionWrapper) Endpoint() string {
 	return c.endpoint
 }
 
-func (c *ConnectionWrapper) Connection() interface{} {
+func (c *ConnectionWrapper) Connection() any {
 	return c.conn
 }
 

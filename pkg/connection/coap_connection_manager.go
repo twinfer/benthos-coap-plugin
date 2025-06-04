@@ -12,12 +12,12 @@ import (
 )
 
 type Manager struct {
-	pools        map[string]*ConnectionPool
-	endpointMap  map[string]string // maps cleaned endpoint to original endpoint
-	config       Config
-	logger       *service.Logger
-	metrics      *Metrics
-	mu           sync.RWMutex
+	pools       map[string]*ConnectionPool
+	endpointMap map[string]string // maps cleaned endpoint to original endpoint
+	config      Config
+	logger      *service.Logger
+	metrics     *Metrics
+	mu          sync.RWMutex
 }
 
 type Config struct {

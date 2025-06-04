@@ -547,17 +547,17 @@ func (i *Input) Close(ctx context.Context) error {
 }
 
 // Health returns the current health status of the input
-func (i *Input) Health() map[string]interface{} {
+func (i *Input) Health() map[string]any {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 
 	if i.closed {
-		return map[string]interface{}{
+		return map[string]any{
 			"status": "closed",
 		}
 	}
 
-	status := map[string]interface{}{
+	status := map[string]any{
 		"status":        "healthy",
 		"buffer_usage":  fmt.Sprintf("%d/%d", len(i.msgChan), cap(i.msgChan)),
 		"endpoints":     i.connManager.Config().Endpoints,

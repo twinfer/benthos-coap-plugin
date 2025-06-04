@@ -23,7 +23,7 @@ func CalculateBackoff(retryCount int, config BackoffConfig) time.Duration {
 
 	delay := float64(config.InitialInterval)
 
-	for i := 0; i < retryCount; i++ {
+	for range retryCount {
 		delay *= config.Multiplier
 		if delay > float64(config.MaxInterval) {
 			delay = float64(config.MaxInterval)

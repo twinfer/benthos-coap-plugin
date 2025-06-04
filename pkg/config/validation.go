@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -77,13 +78,7 @@ func ValidateSecurityConfig(protocol string, security SecurityConfig) error {
 	}
 
 	// Check if security mode is valid for protocol
-	modeValid := false
-	for _, mode := range validModes {
-		if security.Mode == mode {
-			modeValid = true
-			break
-		}
-	}
+	modeValid := slices.Contains(validModes, security.Mode)
 
 	if !modeValid {
 		return fmt.Errorf("security mode %s not valid for protocol %s, must be one of: %s",
@@ -150,8 +145,8 @@ func ValidateResourcePath(path string) error {
 	}
 
 	// Validate path segments
-	segments := strings.Split(path[1:], "/") // Remove leading /
-	for _, segment := range segments {
+	segments := strings.SplitSeq(path[1:], "/") // Remove leading /
+	for segment := range segments {
 		if segment == "" {
 			continue // Allow empty segments (double slashes)
 		}

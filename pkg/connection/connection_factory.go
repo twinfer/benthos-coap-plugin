@@ -19,9 +19,9 @@ import (
 )
 
 type ConnectionFactory interface {
-	Create(endpoint string, security SecurityConfig) (interface{}, error)
-	Validate(conn interface{}) error
-	Close(conn interface{}) error
+	Create(endpoint string, security SecurityConfig) (any, error)
+	Validate(conn any) error
+	Close(conn any) error
 	Protocol() string
 }
 
@@ -32,11 +32,11 @@ func (f *UDPFactory) Protocol() string {
 	return "udp"
 }
 
-func (f *UDPFactory) Create(endpoint string, security SecurityConfig) (interface{}, error) {
+func (f *UDPFactory) Create(endpoint string, security SecurityConfig) (any, error) {
 	return udp.Dial(endpoint)
 }
 
-func (f *UDPFactory) Validate(conn interface{}) error {
+func (f *UDPFactory) Validate(conn any) error {
 	udpConn, ok := conn.(*client.Conn)
 	if !ok {
 		return fmt.Errorf("invalid connection type for UDP factory")
@@ -49,7 +49,7 @@ func (f *UDPFactory) Validate(conn interface{}) error {
 	return udpConn.Ping(ctx)
 }
 
-func (f *UDPFactory) Close(conn interface{}) error {
+func (f *UDPFactory) Close(conn any) error {
 	if udpConn, ok := conn.(*client.Conn); ok {
 		return udpConn.Close()
 	}
@@ -63,12 +63,12 @@ func (f *TCPFactory) Protocol() string {
 	return "tcp"
 }
 
-func (f *TCPFactory) Create(endpoint string, security SecurityConfig) (interface{}, error) {
+func (f *TCPFactory) Create(endpoint string, security SecurityConfig) (any, error) {
 	// tcp.Dial returns (*client.Conn, error)
 	return tcp.Dial(endpoint)
 }
 
-func (f *TCPFactory) Validate(conn interface{}) error {
+func (f *TCPFactory) Validate(conn any) error {
 	tcpConn, ok := conn.(*coapTCPClient.Conn)
 	if !ok {
 		return fmt.Errorf("invalid connection type for TCP factory")
@@ -88,7 +88,7 @@ func (f *TCPFactory) Validate(conn interface{}) error {
 	}
 }
 
-func (f *TCPFactory) Close(conn interface{}) error {
+func (f *TCPFactory) Close(conn any) error {
 	if tcpConn, ok := conn.(*coapTCPClient.Conn); ok {
 		return tcpConn.Close()
 	}
@@ -102,7 +102,7 @@ func (f *DTLSFactory) Protocol() string {
 	return "udp-dtls"
 }
 
-func (f *DTLSFactory) Create(endpoint string, security SecurityConfig) (interface{}, error) {
+func (f *DTLSFactory) Create(endpoint string, security SecurityConfig) (any, error) {
 	config, err := f.createDTLSConfig(security)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create DTLS config: %w", err)
@@ -164,7 +164,7 @@ func (f *DTLSFactory) createDTLSConfig(security SecurityConfig) (*dtls.Config, e
 	return config, nil
 }
 
-func (f *DTLSFactory) Validate(conn interface{}) error {
+func (f *DTLSFactory) Validate(conn any) error {
 	udpConn, ok := conn.(*client.Conn)
 	if !ok {
 		return fmt.Errorf("invalid connection type for DTLS factory")
@@ -184,7 +184,7 @@ func (f *DTLSFactory) Validate(conn interface{}) error {
 	}
 }
 
-func (f *DTLSFactory) Close(conn interface{}) error {
+func (f *DTLSFactory) Close(conn any) error {
 	if udpConn, ok := conn.(*client.Conn); ok {
 		return udpConn.Close()
 	}
@@ -198,7 +198,7 @@ func (f *TCPTLSFactory) Protocol() string {
 	return "tcp-tls"
 }
 
-func (f *TCPTLSFactory) Create(endpoint string, security SecurityConfig) (interface{}, error) {
+func (f *TCPTLSFactory) Create(endpoint string, security SecurityConfig) (any, error) {
 	config, err := f.createTLSConfig(security)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create TLS config: %w", err)
@@ -248,7 +248,7 @@ func (f *TCPTLSFactory) createTLSConfig(security SecurityConfig) (*tls.Config, e
 	return config, nil
 }
 
-func (f *TCPTLSFactory) Validate(conn interface{}) error {
+func (f *TCPTLSFactory) Validate(conn any) error {
 	tcpConn, ok := conn.(*coapTCPClient.Conn)
 	if !ok {
 		return fmt.Errorf("invalid connection type for TCP-TLS factory")
@@ -268,7 +268,7 @@ func (f *TCPTLSFactory) Validate(conn interface{}) error {
 	}
 }
 
-func (f *TCPTLSFactory) Close(conn interface{}) error {
+func (f *TCPTLSFactory) Close(conn any) error {
 	if tcpConn, ok := conn.(*coapTCPClient.Conn); ok {
 		return tcpConn.Close()
 	}

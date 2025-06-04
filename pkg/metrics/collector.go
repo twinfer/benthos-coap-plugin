@@ -3,6 +3,7 @@ package metrics
 
 import (
 	"context"
+	"maps"
 	"sync"
 	"time"
 )
@@ -12,7 +13,7 @@ type Collector struct {
 	manager *Manager
 
 	// Collected data
-	data map[string]interface{}
+	data map[string]any
 	mu   sync.RWMutex
 
 	// Collection interval
@@ -25,7 +26,7 @@ type Collector struct {
 func NewCollector(manager *Manager, interval time.Duration) *Collector {
 	return &Collector{
 		manager:  manager,
-		data:     make(map[string]interface{}),
+		data:     make(map[string]any),
 		interval: interval,
 		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),
@@ -57,14 +58,12 @@ func (c *Collector) Stop() {
 }
 
 // GetData returns collected metrics data
-func (c *Collector) GetData() map[string]interface{} {
+func (c *Collector) GetData() map[string]any {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	result := make(map[string]interface{})
-	for k, v := range c.data {
-		result[k] = v
-	}
+	result := make(map[string]any)
+	maps.Copy(result, c.data)
 	return result
 }
 
@@ -77,7 +76,7 @@ func (c *Collector) collect() {
 
 	// Note: In a real implementation, you would extract actual values
 	// from the Benthos metrics. This is a simplified version.
-	c.data["summary"] = map[string]interface{}{
+	c.data["summary"] = map[string]any{
 		"connections_active":    0, // Would get from actual metric
 		"messages_processed":    0,
 		"errors_total":          0,

@@ -18,6 +18,7 @@ import (
 	"github.com/twinfer/benthos-coap-plugin/pkg/connection"
 	"github.com/twinfer/benthos-coap-plugin/pkg/converter"
 	"github.com/twinfer/benthos-coap-plugin/pkg/utils"
+	"slices"
 )
 
 type Manager struct {
@@ -62,7 +63,7 @@ type Subscription struct {
 	cancel          context.CancelFunc
 	healthy         int32
 	mu              sync.RWMutex
-	coapObservation interface{} // Stores client.Observation from the observe call
+	coapObservation any // Stores client.Observation from the observe call
 }
 
 type Metrics struct {
@@ -85,11 +86,9 @@ func NewManager(config Config, connManager *connection.Manager, converter *conve
 	}
 
 	// Validate observe paths
-	for _, path := range config.ObservePaths {
-		if path == "" {
-			cancel() // Prevent context leak
-			return nil, fmt.Errorf("observe path cannot be empty")
-		}
+	if slices.Contains(config.ObservePaths, "") {
+		cancel() // Prevent context leak
+		return nil, fmt.Errorf("observe path cannot be empty")
 	}
 
 	// Validate retry policy
@@ -361,7 +360,7 @@ func (m *Manager) handleObserveMessage(path string, coapMsg *message.Message) {
 	// Add the original observe path as metadata since CoAP notifications
 	// don't include URI-Path options in the response
 	benthosMsg.MetaSet("coap_uri_path", path)
-	
+
 	// Add extra metadata not handled by the generic converter, if any.
 	// The converter should ideally handle Token, Observe option, etc.
 	// For now, let's assume converter.CoAPToMessage populates essential fields.
@@ -444,15 +443,15 @@ func (m *Manager) Close() error {
 	return nil
 }
 
-func (m *Manager) HealthStatus() map[string]interface{} {
+func (m *Manager) HealthStatus() map[string]any {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	status := make(map[string]interface{})
+	status := make(map[string]any)
 	healthyCount := 0
 
 	for path, sub := range m.subscriptions {
-		subStatus := map[string]interface{}{
+		subStatus := map[string]any{
 			"healthy":       atomic.LoadInt32(&sub.healthy) == 1,
 			"retry_count":   atomic.LoadInt32(&sub.retryCount),
 			"last_seen":     sub.lastSeen.Format(time.RFC3339),
@@ -469,7 +468,7 @@ func (m *Manager) HealthStatus() map[string]interface{} {
 		endpoints = m.connManager.Config().Endpoints
 	}
 
-	status["summary"] = map[string]interface{}{
+	status["summary"] = map[string]any{
 		"endpoints":             endpoints,
 		"observe_paths":         m.config.ObservePaths,
 		"total_subscriptions":   len(m.subscriptions),

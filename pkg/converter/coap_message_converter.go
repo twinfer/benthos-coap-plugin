@@ -236,7 +236,7 @@ func (c *Converter) processJSONPayload(msg *service.Message) error {
 	}
 
 	// Validate JSON
-	var jsonData interface{}
+	var jsonData any
 	if err := json.Unmarshal(payload, &jsonData); err != nil {
 		return fmt.Errorf("invalid JSON payload: %w", err)
 	}
@@ -310,7 +310,7 @@ func (c *Converter) autoDetectContentFormat(payload []byte) uint32 {
 	}
 
 	// Try JSON
-	var jsonData interface{}
+	var jsonData any
 	if json.Unmarshal(payload, &jsonData) == nil {
 		return AppJSON
 	}
@@ -383,8 +383,8 @@ func (c *Converter) addOptionsFromMetadata(coapMsg *message.Message, msg *servic
 
 	// Handle explicitly set URI query
 	if uriQueryStr, exists := msg.MetaGet("coap_uri_query"); exists {
-		queries := strings.Split(uriQueryStr, "&")
-		for _, q := range queries {
+		queries := strings.SplitSeq(uriQueryStr, "&")
+		for q := range queries {
 			var err error
 			queryBuf := make([]byte, 256) // Fresh buffer for each query
 			coapMsg.Options, _, err = coapMsg.Options.AddString(queryBuf, message.URIQuery, q)

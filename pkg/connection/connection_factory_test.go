@@ -344,8 +344,7 @@ func TestSecurityConfig(t *testing.T) {
 func BenchmarkCreateFactory(b *testing.B) {
 	protocols := []string{"udp", "tcp", "udp-dtls", "tcp-tls"}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		protocol := protocols[i%len(protocols)]
 		factory, err := CreateFactory(protocol)
 		if err != nil {
@@ -388,8 +387,7 @@ func BenchmarkUDPConnection(b *testing.B) {
 
 	factory := &UDPFactory{}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		conn, err := factory.Create(serverConn.LocalAddr().String(), SecurityConfig{})
 		if err != nil {
 			b.Fatal(err)
