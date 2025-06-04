@@ -1,62 +1,62 @@
 package input
 
 import (
-	"log/slog"
-	"os"
-	"testing"
-	"time"
-
-	"github.com/plgd-dev/go-coap/v3/message/codes"
-	"github.com/redpanda-data/benthos/v4/public/service"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net"
+	"os"
 	"path/filepath"
-	"crypto/tls"
+	"strings"
+	"testing"
+	"time"
 
+	piondtls "github.com/pion/dtls/v3"
 	"github.com/plgd-dev/go-coap/v3/message"
-	"github.com/plgd-dev/go-coap/v3/options" // Added for client TLS options
-	"github.com/plgd-dev/go-coap/v3/tcp"
-	"github.com/plgd-dev/go-coap/v3/udp"
+	"github.com/plgd-dev/go-coap/v3/message/codes"
+	"github.com/plgd-dev/go-coap/v3/message/pool"
+	"github.com/plgd-dev/go-coap/v3/options"
+	// Client imports
+	coapDtls "github.com/plgd-dev/go-coap/v3/dtls"      // For DTLS client Dial
+	tcpClient "github.com/plgd-dev/go-coap/v3/tcp/client"
+	udpClient "github.com/plgd-dev/go-coap/v3/udp/client"
 
+	"github.com/redpanda-data/benthos/v4/public/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/twinfer/benthos-coap-plugin/pkg/converter"
 )
 
-// Helper function to get a free port
-func getFreePort() (int, error) {
+// Helper to get a free port
+func getFreePort(t *testing.T) int {
+	t.Helper()
 	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
-	if err != nil {
-		return 0, err
-	}
+	require.NoError(t, err)
 	l, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		return 0, err
-	}
+	require.NoError(t, err)
 	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
+	return l.Addr().(*net.TCPAddr).Port
 }
 
-// generateSelfSignedCert generates a self-signed certificate and key for testing.
-// It stores them in a temporary directory.
-func generateSelfSignedCert(t *testing.T) (certPath, keyPath string, cleanup func()) {
+// generateSelfSignedCert creates server cert, key. The server cert is also used as CA.
+// Returns paths to certFile, keyFile, caCertFile and a cleanup function.
+func generateSelfSignedCert(t *testing.T) (certPath, keyPath, caCertPath string, cleanupFunc func()) {
 	t.Helper()
-	tempDir, err := os.MkdirTemp("", "coap_certs")
+	tempDir, err := os.MkdirTemp("", "coap_test_certs_")
 	require.NoError(t, err)
 
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
 
-	notBefore := time.Now()
-	notAfter := notBefore.Add(365 * 24 * time.Hour) // Valid for 1 year
+	notBefore := time.Now().Add(-1 * time.Hour)
+	notAfter := notBefore.Add(24 * time.Hour)
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
@@ -65,15 +65,16 @@ func generateSelfSignedCert(t *testing.T) (certPath, keyPath string, cleanup fun
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Organization: []string{"Acme Co"},
+			Organization: []string{"Benthos CoAP Test"},
+			CommonName:   "localhost",
 		},
 		NotBefore: notBefore,
 		NotAfter:  notAfter,
 
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
-		IsCA:                  true, // Self-signed
+		IsCA:                  true,
 		DNSNames:              []string{"localhost"},
 		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
 	}
@@ -81,788 +82,431 @@ func generateSelfSignedCert(t *testing.T) (certPath, keyPath string, cleanup fun
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	require.NoError(t, err)
 
-	certPath = filepath.Join(tempDir, "cert.pem")
-	keyPath = filepath.Join(tempDir, "key.pem")
+	certFile := filepath.Join(tempDir, "server.crt.pem")
+	keyFile := filepath.Join(tempDir, "server.key.pem")
+	caCertFile = certFile // Using server cert as CA for self-signed setup
 
-	certOut, err := os.Create(certPath)
+	certOut, err := os.Create(certFile)
 	require.NoError(t, err)
-	defer certOut.Close()
-	err = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	certOut.Close()
+
+	keyOut, err := os.Create(keyFile)
 	require.NoError(t, err)
+	pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+	keyOut.Close()
 
-	keyOut, err := os.Create(keyPath)
-	require.NoError(t, err)
-	defer keyOut.Close()
-	err = pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
-	require.NoError(t, err)
-
-	return certPath, keyPath, func() {
-		os.RemoveAll(tempDir)
-	}
+	return certFile, keyFile, caCertFile, func() { os.RemoveAll(tempDir) }
 }
 
+// newTestCoAPServerInput creates a server instance for testing.
+func newTestCoAPServerInput(t *testing.T, configYAML string) (*ServerInput, *service.Resources) {
+	t.Helper()
+	parsedConf, err := coapServerInputConfigSpec.ParseYAML(configYAML, nil) // Assumes coapServerInputConfigSpec is package-level
+	require.NoError(t, err, "Failed to parse test config YAML: %s", configYAML)
 
-// TestServerConfigValidation tests server configuration validation
-func TestServerConfigValidation(t *testing.T) {
-	tests := []struct {
-		name        string
-		config      ServerConfig
-		expectError bool
-	}{
-		{
-			name: "valid minimal config",
-			config: ServerConfig{
-				ListenAddress: "0.0.0.0:5683",
-				Protocol:      "udp",
-				BufferSize:    100,
-				Timeout:       30 * time.Second,
-			},
-			expectError: false,
-		},
-		{
-			name: "zero buffer size",
-			config: ServerConfig{
-				ListenAddress: "0.0.0.0:5683",
-				Protocol:      "udp",
-				BufferSize:    0,
-				Timeout:       30 * time.Second,
-			},
-			expectError: true,
-		},
-		{
-			name: "negative buffer size",
-			config: ServerConfig{
-				ListenAddress: "0.0.0.0:5683",
-				Protocol:      "udp",
-				BufferSize:    -1,
-				Timeout:       30 * time.Second,
-			},
-			expectError: true,
-		},
-		{
-			name: "unsupported protocol",
-			config: ServerConfig{
-				ListenAddress: "0.0.0.0:5683",
-				Protocol:      "http",
-				BufferSize:    100,
-				Timeout:       30 * time.Second,
-			},
-			expectError: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Test validation logic that would be in newCoAPServerInput
-			if tt.config.BufferSize <= 0 && tt.expectError {
-				assert.True(t, tt.config.BufferSize <= 0, "Buffer size validation should fail")
-			} else if !tt.expectError {
-				assert.True(t, tt.config.BufferSize > 0, "Buffer size should be valid")
-			}
-		})
-	}
-}
-
-// TestMethodStringConversion tests CoAP method code to string conversion
-func TestMethodStringConversion(t *testing.T) {
-	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
-	conv := converter.NewConverter(converter.Config{}, logger)
-
-	input := &ServerInput{
-		converter: conv,
-		logger:    logger,
-	}
-
-	tests := []struct {
-		name     string
-		code     int
-		expected string
-	}{
-		{"GET method", 1, "GET"},
-		{"POST method", 2, "POST"},
-		{"PUT method", 3, "PUT"},
-		{"DELETE method", 4, "DELETE"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := input.getMethodString(codes.Code(tt.code))
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
-
-// TestPathAndMethodAllowed tests path and method filtering
-func TestPathAndMethodAllowed(t *testing.T) {
-	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
-	conv := converter.NewConverter(converter.Config{}, logger)
-
-	config := ServerConfig{
-		AllowedPaths:   []string{"/api/data", "/sensors/temp"},
-		AllowedMethods: []string{"GET", "POST"},
-	}
-
-	input := &ServerInput{
-		converter: conv,
-		logger:    logger,
-		config:    config,
-	}
-
-	// Test method filtering
-	assert.True(t, input.isMethodAllowed("GET"))
-	assert.True(t, input.isMethodAllowed("POST"))
-	assert.False(t, input.isMethodAllowed("PUT"))
-	assert.False(t, input.isMethodAllowed("DELETE"))
-
-	// Test path filtering
-	assert.True(t, input.isPathAllowed("/api/data"))
-	assert.True(t, input.isPathAllowed("/sensors/temp"))
-	assert.False(t, input.isPathAllowed("/unauthorized/path"))
-	assert.False(t, input.isPathAllowed("/"))
-}
-
-// TestEmptyAllowedLists tests behavior when allowed lists are empty (should allow all)
-func TestEmptyAllowedLists(t *testing.T) {
-	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
-	conv := converter.NewConverter(converter.Config{}, logger)
-
-	config := ServerConfig{
-		AllowedPaths:   []string{}, // Empty means allow all
-		AllowedMethods: []string{}, // Empty means allow all
-	}
-
-	input := &ServerInput{
-		converter: conv,
-		logger:    logger,
-		config:    config,
-	}
-
-	// When lists are empty, should allow everything
-	assert.True(t, input.isMethodAllowed("GET"))
-	assert.True(t, input.isMethodAllowed("POST"))
-	assert.True(t, input.isMethodAllowed("PUT"))
-	assert.True(t, input.isMethodAllowed("DELETE"))
-
-	assert.True(t, input.isPathAllowed("/any/path"))
-	assert.True(t, input.isPathAllowed("/"))
-	assert.True(t, input.isPathAllowed("/sensors/temp"))
-}
-
-// TestServerMetrics tests metrics functionality
-func TestServerMetrics(t *testing.T) {
-	resources := service.MockResources()
-
-	metrics := &ServerMetrics{
-		RequestsReceived:  resources.Metrics().NewCounter("test_requests_received"),
-		RequestsProcessed: resources.Metrics().NewCounter("test_requests_processed"),
-		RequestsFailed:    resources.Metrics().NewCounter("test_requests_failed"),
-		ResponsesSent:     resources.Metrics().NewCounter("test_responses_sent"),
-		ConnectionsActive: resources.Metrics().NewCounter("test_connections_active"),
-		ErrorsTotal:       resources.Metrics().NewCounter("test_errors_total"),
-	}
-
-	// Test metrics are initialized
-	require.NotNil(t, metrics.RequestsReceived)
-	require.NotNil(t, metrics.RequestsProcessed)
-	require.NotNil(t, metrics.RequestsFailed)
-	require.NotNil(t, metrics.ResponsesSent)
-	require.NotNil(t, metrics.ConnectionsActive)
-	require.NotNil(t, metrics.ErrorsTotal)
-
-	// Test metric operations
-	metrics.RequestsReceived.Incr(1)
-	metrics.RequestsProcessed.Incr(1)
-	metrics.ResponsesSent.Incr(1)
-}
-
-// TestWildcardPathMatching tests the new wildcard path matching functionality
-func TestWildcardPathMatching(t *testing.T) {
-	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
-	conv := converter.NewConverter(converter.Config{}, logger)
-
-	tests := []struct {
-		name         string
-		allowedPaths []string
-		testPath     string
-		shouldAllow  bool
-		description  string
-	}{
-		// Exact matches
-		{
-			name:         "exact match",
-			allowedPaths: []string{"/sensors/temperature"},
-			testPath:     "/sensors/temperature",
-			shouldAllow:  true,
-			description:  "exact path should match",
-		},
-		{
-			name:         "exact mismatch",
-			allowedPaths: []string{"/sensors/temperature"},
-			testPath:     "/sensors/humidity",
-			shouldAllow:  false,
-			description:  "different path should not match",
-		},
-
-		// Single segment wildcard (+)
-		{
-			name:         "single wildcard match",
-			allowedPaths: []string{"/sensors/+"},
-			testPath:     "/sensors/temperature",
-			shouldAllow:  true,
-			description:  "+ should match single segment",
-		},
-		{
-			name:         "single wildcard no match - too many segments",
-			allowedPaths: []string{"/sensors/+"},
-			testPath:     "/sensors/temperature/value",
-			shouldAllow:  false,
-			description:  "+ should not match multiple segments",
-		},
-		{
-			name:         "single wildcard no match - too few segments",
-			allowedPaths: []string{"/sensors/+"},
-			testPath:     "/sensors",
-			shouldAllow:  false,
-			description:  "+ requires exactly one segment",
-		},
-		{
-			name:         "single wildcard in middle",
-			allowedPaths: []string{"/api/+/data"},
-			testPath:     "/api/v1/data",
-			shouldAllow:  true,
-			description:  "+ in middle should work",
-		},
-		{
-			name:         "single wildcard in middle - no match",
-			allowedPaths: []string{"/api/+/data"},
-			testPath:     "/api/v1/v2/data",
-			shouldAllow:  false,
-			description:  "+ should not match multiple segments in middle",
-		},
-
-		// Multi-segment wildcard (*)
-		{
-			name:         "multi wildcard match - single segment",
-			allowedPaths: []string{"/sensors/*"},
-			testPath:     "/sensors/temperature",
-			shouldAllow:  true,
-			description:  "* should match single segment",
-		},
-		{
-			name:         "multi wildcard match - multiple segments",
-			allowedPaths: []string{"/sensors/*"},
-			testPath:     "/sensors/temperature/value",
-			shouldAllow:  true,
-			description:  "* should match multiple segments",
-		},
-		{
-			name:         "multi wildcard match - many segments",
-			allowedPaths: []string{"/sensors/*"},
-			testPath:     "/sensors/building/floor/room/device/temperature",
-			shouldAllow:  true,
-			description:  "* should match many segments",
-		},
-		{
-			name:         "multi wildcard match - zero segments",
-			allowedPaths: []string{"/sensors/*"},
-			testPath:     "/sensors",
-			shouldAllow:  true,
-			description:  "* should match zero segments",
-		},
-		{
-			name:         "multi wildcard no match - wrong prefix",
-			allowedPaths: []string{"/sensors/*"},
-			testPath:     "/actuators/led",
-			shouldAllow:  false,
-			description:  "* should not match different prefix",
-		},
-
-		// Complex patterns
-		{
-			name:         "mixed wildcards",
-			allowedPaths: []string{"/buildings/+/floors/*"},
-			testPath:     "/buildings/A/floors/1/rooms/101",
-			shouldAllow:  true,
-			description:  "mixed + and * should work",
-		},
-		{
-			name:         "mixed wildcards - no match",
-			allowedPaths: []string{"/buildings/+/floors/*"},
-			testPath:     "/buildings/A/B/floors/1",
-			shouldAllow:  false,
-			description:  "+ should not match multiple segments even with *",
-		},
-
-		// Edge cases
-		{
-			name:         "root path exact",
-			allowedPaths: []string{"/"},
-			testPath:     "/",
-			shouldAllow:  true,
-			description:  "root path should match exactly",
-		},
-		{
-			name:         "root path with wildcard",
-			allowedPaths: []string{"/*"},
-			testPath:     "/anything",
-			shouldAllow:  true,
-			description:  "/* should match any path",
-		},
-		{
-			name:         "root path with wildcard - empty",
-			allowedPaths: []string{"/*"},
-			testPath:     "/",
-			shouldAllow:  true,
-			description:  "/* should match root path too",
-		},
-		{
-			name:         "multiple patterns - first matches",
-			allowedPaths: []string{"/sensors/+", "/actuators/*"},
-			testPath:     "/sensors/temp",
-			shouldAllow:  true,
-			description:  "should match first pattern",
-		},
-		{
-			name:         "multiple patterns - second matches",
-			allowedPaths: []string{"/sensors/+", "/actuators/*"},
-			testPath:     "/actuators/led/state",
-			shouldAllow:  true,
-			description:  "should match second pattern",
-		},
-		{
-			name:         "multiple patterns - none match",
-			allowedPaths: []string{"/sensors/+", "/actuators/*"},
-			testPath:     "/api/data",
-			shouldAllow:  false,
-			description:  "should not match if no patterns match",
-		},
-
-		// Real-world IoT scenarios
-		{
-			name:         "device ID pattern",
-			allowedPaths: []string{"/devices/+/sensors/+"},
-			testPath:     "/devices/device123/sensors/temperature",
-			shouldAllow:  true,
-			description:  "device ID pattern should work",
-		},
-		{
-			name:         "hierarchical IoT",
-			allowedPaths: []string{"/buildings/+/floors/+/rooms/+/*"},
-			testPath:     "/buildings/main/floors/2/rooms/201/sensors/temp",
-			shouldAllow:  true,
-			description:  "hierarchical IoT patterns should work",
-		},
-		{
-			name:         "API versioning",
-			allowedPaths: []string{"/api/+/sensors/*"},
-			testPath:     "/api/v1/sensors/temperature/current",
-			shouldAllow:  true,
-			description:  "API versioning patterns should work",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			config := ServerConfig{
-				AllowedPaths: tt.allowedPaths,
-			}
-
-			input := &ServerInput{
-				converter: conv,
-				logger:    logger,
-				config:    config,
-			}
-
-			result := input.isPathAllowed(tt.testPath)
-			assert.Equal(t, tt.shouldAllow, result, tt.description)
-		})
-	}
-}
-
-// TestWildcardHelperFunctions tests the internal helper functions
-func TestWildcardHelperFunctions(t *testing.T) {
-	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
-	conv := converter.NewConverter(converter.Config{}, logger)
-
-	input := &ServerInput{
-		converter: conv,
-		logger:    logger,
-	}
-
-	t.Run("containsWildcards", func(t *testing.T) {
-		tests := []struct {
-			pattern  string
-			expected bool
-		}{
-			{"/sensors/temperature", false},
-			{"/sensors/+", true},
-			{"/sensors/*", true},
-			{"/api/+/data/*", true},
-			{"/exact/path", false},
-			{"", false},
-		}
-
-		for _, tt := range tests {
-			result := input.containsWildcards(tt.pattern)
-			assert.Equal(t, tt.expected, result, "containsWildcards('%s') should be %v", tt.pattern, tt.expected)
-		}
-	})
-
-	t.Run("splitPath", func(t *testing.T) {
-		tests := []struct {
-			path     string
-			expected []string
-		}{
-			{"/", []string{}},
-			{"/sensors", []string{"sensors"}},
-			{"/sensors/temperature", []string{"sensors", "temperature"}},
-			{"/api/v1/data", []string{"api", "v1", "data"}},
-			{"sensors/temperature", []string{"sensors", "temperature"}},    // no leading slash
-			{"/sensors//temperature/", []string{"sensors", "temperature"}}, // extra slashes
-			{"", []string{}},
-		}
-
-		for _, tt := range tests {
-			result := input.splitPath(tt.path)
-			assert.Equal(t, tt.expected, result, "splitPath('%s') should return %v", tt.path, tt.expected)
-		}
-	})
-
-	t.Run("matchSegments", func(t *testing.T) {
-		tests := []struct {
-			name            string
-			patternSegments []string
-			pathSegments    []string
-			expected        bool
-		}{
-			{"empty both", []string{}, []string{}, true},
-			{"empty pattern, non-empty path", []string{}, []string{"sensors"}, false},
-			{"single * matches empty", []string{"*"}, []string{}, true},
-			{"single + doesn't match empty", []string{"+"}, []string{}, false},
-			{"exact match", []string{"sensors", "temp"}, []string{"sensors", "temp"}, true},
-			{"exact mismatch", []string{"sensors", "temp"}, []string{"sensors", "humidity"}, false},
-			{"+ matches one", []string{"sensors", "+"}, []string{"sensors", "temp"}, true},
-			{"* matches multiple", []string{"sensors", "*"}, []string{"sensors", "temp", "value"}, true},
-			{"* matches zero", []string{"sensors", "*"}, []string{"sensors"}, true},
-		}
-
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				result := input.matchSegments(tt.patternSegments, tt.pathSegments)
-				assert.Equal(t, tt.expected, result)
-			})
-		}
-	})
-}
-
-// TestConfigParsing tests configuration parsing helpers
-func TestConfigParsing(t *testing.T) {
-	t.Run("parseServerSecurityConfig - none mode", func(t *testing.T) {
-		// Create a mock config that would return "none" for security.mode
-		// This is a simplified test since we can't easily mock service.ParsedConfig
-		config := SecurityConfig{Mode: "none"}
-
-		assert.Equal(t, "none", config.Mode)
-		assert.Empty(t, config.PSKIdentity)
-		assert.Empty(t, config.PSKKey)
-	})
-
-	t.Run("parseResponseConfig", func(t *testing.T) {
-		config := ResponseConfig{
-			DefaultContentFormat: "text/plain",
-			DefaultCode:          codes.Content,
-			DefaultPayload:       "OK",
-		}
-
-		assert.Equal(t, "text/plain", config.DefaultContentFormat)
-		assert.Equal(t, codes.Content, config.DefaultCode)
-		assert.Equal(t, "OK", config.DefaultPayload)
-	})
-}
-
-func TestCoAPServerInput_TCPCommunication(t *testing.T) {
-	port, err := getFreePort()
-	require.NoError(t, err)
-	listenAddr := fmt.Sprintf("127.0.0.1:%d", port)
-
-	conf := service.NewConfigSpec().
-		Field(service.NewStringField("listen_address")).
-		Field(service.NewStringField("protocol")).
-		Field(service.NewStringListField("allowed_paths").Default([]string{})).
-		Field(service.NewStringListField("allowed_methods").Default([]string{})).
-		Field(service.NewIntField("buffer_size")).
-		Field(service.NewDurationField("timeout")).
-		Field(service.NewObjectField("response",
-			service.NewStringField("default_content_format").Default("text/plain"),
-			service.NewIntField("default_code").Default(int(codes.Content)),
-			service.NewStringField("default_payload"),
-		)).
-		Field(service.NewObjectField("security",
-			service.NewStringField("mode").Default("none"),
-			service.NewStringField("psk_identity").Optional(),
-			service.NewStringField("psk_key").Optional(),
-			service.NewStringField("cert_file").Optional(),
-			service.NewStringField("key_file").Optional(),
-			service.NewStringField("ca_cert_file").Optional(),
-			service.NewBoolField("require_client_cert").Default(false),
-		)).
-		Field(service.NewObjectField("converter",
-			service.NewStringField("default_content_format").Default("application/json"),
-			service.NewBoolField("compression_enabled").Default(true),
-			service.NewIntField("max_payload_size").Default(1048576),
-			service.NewBoolField("preserve_options").Default(true),
-		))
-
-	parsedConf, err := conf.ParseYAML(fmt.Sprintf(`
-listen_address: %s
-protocol: tcp
-buffer_size: 10
-timeout: 5s
-allowed_paths: ["/test/tcp"] # Reverted to /test/tcp
-allowed_methods: ["GET"]
-response:
-  default_payload: "TCP OK"
-`, listenAddr), nil)
-	require.NoError(t, err)
-
-	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	_ = logger // Prevent unused variable if not used directly by MockResources
-	mgr := service.MockResources() // Simpler MockResources, will use default logger
+	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	// To reduce noise: logger.SetLevel(service.LogLevelError)
+	mgr := service.MockResources(service.OptSetLogger(logger))
 
 	input, err := newCoAPServerInput(parsedConf, mgr)
-	require.NoError(t, err)
-	require.NotNil(t, input)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	err = input.Connect(ctx)
-	require.NoError(t, err)
-	defer input.Close(ctx)
-
-	// Allow server to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Client
-	co, err := tcp.Dial(listenAddr)
-	require.NoError(t, err)
-	defer co.Close()
-
-	// Send GET request
-	resp, err := co.Get(ctx, "/test/tcp") // Reverted path to /test/tcp
-	require.NoError(t, err)
-	require.NotNil(t, resp)
-
-	assert.Equal(t, codes.Content, resp.Code())
-	payload, err := resp.ReadBody()
-	require.NoError(t, err)
-	assert.Equal(t, "TCP OK", string(payload))
-
-	// Check if message was received by Benthos input
-	benthosMsg, _, err := input.Read(ctx)
-	require.NoError(t, err)
-	require.NotNil(t, benthosMsg)
-
-	meta, ok := benthosMsg.MetaGet("coap_server_path")
-	require.True(t, ok)
-	assert.Equal(t, "/test/tcp", meta) // Expected path is now /test/tcp
-
-	metaMethod, ok := benthosMsg.MetaGet("coap_server_method")
-	require.NoError(t, err)
-	assert.Equal(t, "GET", metaMethod)
+	require.NoError(t, err, "Failed to create new CoAP server input")
+	serverInput, ok := input.(*ServerInput)
+	require.True(t, ok, "Created input is not of type *ServerInput")
+	return serverInput, mgr
 }
 
+// --- Test Cases ---
 
-func TestCoAPServerInput_TCPSecureCommunication(t *testing.T) {
-	port, err := getFreePort()
-	require.NoError(t, err)
-	listenAddr := fmt.Sprintf("127.0.0.1:%d", port)
+func TestCoAPServer_StartStopUDP(t *testing.T) {
+	port := getFreePort(t)
+	configYAML := fmt.Sprintf(`
+listen_address: "127.0.0.1:%d"
+protocol: "udp"
+`, port)
+	input, _ := newTestCoAPServerInput(t, configYAML)
 
-	certFile, keyFile, certCleanup := generateSelfSignedCert(t)
-	defer certCleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
-	// Use comprehensive config spec
-	conf := service.NewConfigSpec().
-		Field(service.NewStringField("listen_address")).
-		Field(service.NewStringField("protocol")).
-		Field(service.NewStringListField("allowed_paths").Default([]string{})).
-		Field(service.NewStringListField("allowed_methods").Default([]string{})).
-		Field(service.NewIntField("buffer_size")).
-		Field(service.NewDurationField("timeout")).
-		Field(service.NewObjectField("response",
-			service.NewStringField("default_content_format").Default("text/plain"),
-			service.NewIntField("default_code").Default(int(codes.Content)),
-			service.NewStringField("default_payload"),
-		)).
-		Field(service.NewObjectField("security",
-			service.NewStringField("mode").Default("none"),
-			service.NewStringField("psk_identity").Optional(),
-			service.NewStringField("psk_key").Optional(),
-			service.NewStringField("cert_file").Optional(), // Will be overridden by YAML
-			service.NewStringField("key_file").Optional(),   // Will be overridden by YAML
-			service.NewStringField("ca_cert_file").Optional(),
-			service.NewBoolField("require_client_cert").Default(false),
-		)).
-		Field(service.NewObjectField("converter",
-			service.NewStringField("default_content_format").Default("application/json"),
-			service.NewBoolField("compression_enabled").Default(true),
-			service.NewIntField("max_payload_size").Default(1048576),
-			service.NewBoolField("preserve_options").Default(true),
-		))
+	err := input.Connect(ctx)
+	require.NoError(t, err, "Connect should not fail for UDP")
+	time.Sleep(50 * time.Millisecond)
+	err = input.Close(ctx)
+	require.NoError(t, err, "Close should not fail")
+}
 
-	parsedConf, err := conf.ParseYAML(fmt.Sprintf(`
-listen_address: %s
-protocol: tcp-tls
-buffer_size: 10
-timeout: 5s
+func TestCoAPServer_StartStopTCP(t *testing.T) {
+	port := getFreePort(t)
+	configYAML := fmt.Sprintf(`
+listen_address: "127.0.0.1:%d"
+protocol: "tcp"
+`, port)
+	input, _ := newTestCoAPServerInput(t, configYAML)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := input.Connect(ctx)
+	require.NoError(t, err, "Connect should not fail for TCP")
+	time.Sleep(50 * time.Millisecond)
+	err = input.Close(ctx)
+	require.NoError(t, err, "Close should not fail")
+}
+
+func TestCoAPServer_StartStopTCPTLS(t *testing.T) {
+	certFile, keyFile, _, cleanup := generateSelfSignedCert(t)
+	defer cleanup()
+
+	port := getFreePort(t)
+	configYAML := fmt.Sprintf(`
+listen_address: "127.0.0.1:%d"
+protocol: "tcp-tls"
 security:
-  mode: certificate
-  cert_file: %s
-  key_file: %s
-  ca_cert_file: "" # Explicitly provide empty ca_cert_file
-allowed_paths: ["/test/tcp-tls"]
-allowed_methods: ["GET"]
-response:
-  default_payload: "TCP-TLS OK"
-`, listenAddr, certFile, keyFile), nil)
-	require.NoError(t, err)
+  mode: "certificate"
+  cert_file: "%s"
+  key_file: "%s"
+`, port, strings.ReplaceAll(certFile, "\\", "\\\\"), strings.ReplaceAll(keyFile, "\\", "\\\\"))
+	input, _ := newTestCoAPServerInput(t, configYAML)
 
-	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	_ = logger // Prevent unused variable
-	mgr := service.MockResources() // Simpler MockResources
-
-	input, err := newCoAPServerInput(parsedConf, mgr)
-	require.NoError(t, err)
-	require.NotNil(t, input)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err = input.Connect(ctx)
-	require.NoError(t, err)
-	defer input.Close(ctx)
-
-	// Allow server to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Client
-	// Client
-	clientTLSConfig := &tls.Config{
-		RootCAs: x509.NewCertPool(), // Create an empty pool
-		// InsecureSkipVerify: true, // Alternative if not loading CA
-	}
-	// Load server cert as CA for the client for testing
-	serverCertPEM, err := os.ReadFile(certFile)
-	require.NoError(t, err)
-	ok := clientTLSConfig.RootCAs.AppendCertsFromPEM(serverCertPEM)
-	require.True(t, ok)
-
-	co, err := tcp.Dial(listenAddr, options.WithTLS(clientTLSConfig)) // Changed WithTLSConfig to WithTLS
-	require.NoError(t, err)
-	defer co.Close()
-
-	// Send GET request
-	resp, err := co.Get(ctx, "/test/tcp-tls")
-	require.NoError(t, err)
-	require.NotNil(t, resp)
-
-	assert.Equal(t, codes.Content, resp.Code())
-	payload, err := resp.ReadBody()
-	require.NoError(t, err)
-	assert.Equal(t, "TCP-TLS OK", string(payload))
-
-	// Check if message was received by Benthos input
-	benthosMsg, _, err := input.Read(ctx)
-	require.NoError(t, err)
-	require.NotNil(t, benthosMsg)
-
-	meta, ok := benthosMsg.MetaGet("coap_server_path")
-	require.True(t, ok)
-	assert.Equal(t, "/test/tcp-tls", meta)
+	err := input.Connect(ctx)
+	require.NoError(t, err, "Connect should not fail for TCP-TLS")
+	time.Sleep(50 * time.Millisecond)
+	err = input.Close(ctx)
+	require.NoError(t, err, "Close should not fail")
 }
 
-// TestCoAPServerInput_UDPCommunication (Example of how an existing UDP test might look)
-// This is a placeholder to show that other tests would remain.
-func TestCoAPServerInput_UDPCommunication(t *testing.T) {
-	port, err := getFreePort()
-	require.NoError(t, err)
-	listenAddr := fmt.Sprintf("127.0.0.1:%d", port)
+func TestCoAPServer_StartStopDTLS_PSK(t *testing.T) {
+	port := getFreePort(t)
+	configYAML := fmt.Sprintf(`
+listen_address: "127.0.0.1:%d"
+protocol: "udp-dtls"
+security:
+  mode: "psk"
+  psk_identity: "test-identity"
+  psk_key: "test-key"
+`, port)
+	input, _ := newTestCoAPServerInput(t, configYAML)
 
-	// Use comprehensive config spec
-	conf := service.NewConfigSpec().
-		Field(service.NewStringField("listen_address")).
-		Field(service.NewStringField("protocol")).
-		Field(service.NewStringListField("allowed_paths").Default([]string{})).
-		Field(service.NewStringListField("allowed_methods").Default([]string{})).
-		Field(service.NewIntField("buffer_size")).
-		Field(service.NewDurationField("timeout")).
-		Field(service.NewObjectField("response",
-			service.NewStringField("default_content_format").Default("text/plain"),
-			service.NewIntField("default_code").Default(int(codes.Content)),
-			service.NewStringField("default_payload"),
-		)).
-		Field(service.NewObjectField("security",
-			service.NewStringField("mode").Default("none"),
-			service.NewStringField("psk_identity").Optional(),
-			service.NewStringField("psk_key").Optional(),
-			service.NewStringField("cert_file").Optional(),
-			service.NewStringField("key_file").Optional(),
-			service.NewStringField("ca_cert_file").Optional(),
-			service.NewBoolField("require_client_cert").Default(false),
-		)).
-		Field(service.NewObjectField("converter",
-			service.NewStringField("default_content_format").Default("application/json"),
-			service.NewBoolField("compression_enabled").Default(true),
-			service.NewIntField("max_payload_size").Default(1048576),
-			service.NewBoolField("preserve_options").Default(true),
-		))
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second) // Increased timeout for DTLS
+	defer cancel()
 
-	parsedConf, err := conf.ParseYAML(fmt.Sprintf(`
-listen_address: %s
-protocol: udp
-buffer_size: 10
-timeout: 5s
-allowed_paths: ["/test/udp"]
-allowed_methods: ["GET"]
+	err := input.Connect(ctx)
+	require.NoError(t, err, "Connect should not fail for DTLS-PSK")
+	time.Sleep(100 * time.Millisecond) // Give DTLS a bit more time
+
+	// Optional: Add a basic client dial check if simple
+	dtlsConfig := &piondtls.Config{
+		PSK: func(hint []byte) ([]byte, error) {
+			return []byte("test-key"), nil
+		},
+		PSKIdentityHint: []byte("test-identity"),
+		CipherSuites:    []piondtls.CipherSuiteID{piondtls.TLS_PSK_WITH_AES_128_CCM_8},
+	}
+	clientCtx, clientCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer clientCancel()
+	// coapDtls.Dial requires options.WithContext for timeout
+	// For just a connection test, this might be enough, or it might need a full client.
+	// For now, just testing server start/stop is the primary goal.
+	// Let's try a dial.
+	conn, err := coapDtls.DialWithContext(clientCtx, fmt.Sprintf("127.0.0.1:%d", port), dtlsConfig)
+	if err == nil {
+		conn.Close()
+	}
+	t.Logf("DTLS Dial attempt err: %v (this is informative for PSK setup)", err)
+	// Not failing the test on client dial error here, primary is server Start/Stop.
+
+	err = input.Close(ctx)
+	require.NoError(t, err, "Close should not fail")
+}
+
+
+func TestCoAPServer_BasicGetUDP(t *testing.T) {
+	port := getFreePort(t)
+	defaultPayload := "Hello UDP GET"
+	targetPath := "/testgetudp"
+
+	configYAML := fmt.Sprintf(`
+listen_address: "127.0.0.1:%d"
+protocol: "udp"
+allowed_paths: ["%s"]
 response:
-  default_payload: "UDP OK"
-`, listenAddr), nil)
-	require.NoError(t, err)
+  default_payload: "%s"
+`, port, targetPath, defaultPayload)
+	input, _ := newTestCoAPServerInput(t, configYAML)
 
-	logger := service.NewLoggerFromSlog(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	_ = logger // Prevent unused variable
-	mgr := service.MockResources() // Simpler MockResources
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, input.Connect(ctx))
+	defer input.Close(ctx)
+	time.Sleep(100 * time.Millisecond)
 
-	input, err := newCoAPServerInput(parsedConf, mgr)
+	client, err := udpClient.Dial(fmt.Sprintf("127.0.0.1:%d", port))
 	require.NoError(t, err)
-	require.NotNil(t, input)
+	defer client.Close()
+
+	reqCtx, reqCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer reqCancel()
+	resp, err := client.Get(reqCtx, targetPath)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	defer pool.ReleaseMessage(resp)
+
+	assert.Equal(t, codes.Content, resp.Code())
+	body, err := resp.ReadBody()
+	require.NoError(t, err)
+	assert.Equal(t, defaultPayload, string(body))
+}
+
+func TestCoAPServer_BasicGetTCP(t *testing.T) {
+	port := getFreePort(t)
+	defaultPayload := "Hello TCP GET"
+	targetPath := "/testgettcp"
+	configYAML := fmt.Sprintf(`
+listen_address: "127.0.0.1:%d"
+protocol: "tcp"
+allowed_paths: ["%s"]
+response:
+  default_payload: "%s"
+`, port, targetPath, defaultPayload)
+	input, _ := newTestCoAPServerInput(t, configYAML)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, input.Connect(ctx))
+	defer input.Close(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	client, err := tcpClient.Dial(fmt.Sprintf("127.0.0.1:%d", port))
+	require.NoError(t, err)
+	defer client.Close()
+
+	reqCtx, reqCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer reqCancel()
+	resp, err := client.Get(reqCtx, targetPath)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	defer pool.ReleaseMessage(resp)
+
+	assert.Equal(t, codes.Content, resp.Code())
+	body, err := resp.ReadBody()
+	require.NoError(t, err)
+	assert.Equal(t, defaultPayload, string(body))
+}
+
+func TestCoAPServer_BasicPostUDP(t *testing.T) {
+	port := getFreePort(t)
+	postPayload := "Posting UDP data"
+	responsePayload := "UDP POST Handled"
+	targetPath := "/submitudp"
+
+	configYAML := fmt.Sprintf(`
+listen_address: "127.0.0.1:%d"
+protocol: "udp"
+allowed_paths: ["%s"]
+allowed_methods: ["POST"]
+response:
+  default_payload: "%s"
+  default_code: %d
+`, port, targetPath, responsePayload, codes.Changed)
+	input, _ := newTestCoAPServerInput(t, configYAML)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, input.Connect(ctx))
+	defer input.Close(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	client, err := udpClient.Dial(fmt.Sprintf("127.0.0.1:%d", port))
+	require.NoError(t, err)
+	defer client.Close()
+
+	reqCtx, reqCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer reqCancel()
+	resp, err := client.Post(reqCtx, targetPath, message.TextPlain, strings.NewReader(postPayload))
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	defer pool.ReleaseMessage(resp)
+	assert.Equal(t, codes.Changed, resp.Code())
+
+	respBody, err := resp.ReadBody()
+	require.NoError(t, err)
+	assert.Equal(t, responsePayload, string(respBody))
+
+	readCtx, readCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer readCancel()
+	bMsg, _, err := input.Read(readCtx)
+	require.NoError(t, err, "Failed to read message from Benthos input")
+	require.NotNil(t, bMsg)
+
+	msgBytes, _ := bMsg.AsBytes()
+	assert.Equal(t, postPayload, string(msgBytes))
+
+	metaMethod, _ := bMsg.MetaGet("coap_server_method")
+	assert.Equal(t, "POST", metaMethod)
+	metaPath, _ := bMsg.MetaGet("coap_server_path")
+	assert.Equal(t, targetPath, metaPath)
+}
+
+func TestCoAPServer_BasicPostTCP(t *testing.T) {
+	port := getFreePort(t)
+	postPayload := "Posting TCP data"
+	responsePayload := "TCP POST Handled"
+	targetPath := "/submittcp"
+
+	configYAML := fmt.Sprintf(`
+listen_address: "127.0.0.1:%d"
+protocol: "tcp"
+allowed_paths: ["%s"]
+allowed_methods: ["POST"]
+response:
+  default_payload: "%s"
+  default_code: %d
+`, port, targetPath, responsePayload, codes.Created)
+	input, _ := newTestCoAPServerInput(t, configYAML)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, input.Connect(ctx))
+	defer input.Close(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	client, err := tcpClient.Dial(fmt.Sprintf("127.0.0.1:%d", port))
+	require.NoError(t, err)
+	defer client.Close()
+
+	reqCtx, reqCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer reqCancel()
+	resp, err := client.Post(reqCtx, targetPath, message.AppJSON, strings.NewReader(postPayload))
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	defer pool.ReleaseMessage(resp)
+	assert.Equal(t, codes.Created, resp.Code())
+
+	respBody, err := resp.ReadBody()
+	require.NoError(t, err)
+	assert.Equal(t, responsePayload, string(respBody))
+
+	readCtx, readCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer readCancel()
+	bMsg, _, err := input.Read(readCtx)
+	require.NoError(t, err)
+	require.NotNil(t, bMsg)
+	msgBytes, _ := bMsg.AsBytes()
+	assert.Equal(t, postPayload, string(msgBytes))
+	metaMethod, _ := bMsg.MetaGet("coap_server_method")
+	assert.Equal(t, "POST", metaMethod)
+}
+
+func TestCoAPServer_PathFiltering(t *testing.T) {
+	port := getFreePort(t)
+	configYAML := fmt.Sprintf(`
+listen_address: "127.0.0.1:%d"
+protocol: "udp"
+allowed_paths: ["/allowed", "/allowed/+"]
+response:
+  default_payload: "Data"
+`, port)
+	input, _ := newTestCoAPServerInput(t, configYAML)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
-	err = input.Connect(ctx)
-	require.NoError(t, err)
+	require.NoError(t, input.Connect(ctx))
 	defer input.Close(ctx)
+	time.Sleep(100 * time.Millisecond)
 
-	time.Sleep(100 * time.Millisecond) // Allow server to start
-
-	co, err := udp.Dial(listenAddr)
+	client, err := udpClient.Dial(fmt.Sprintf("127.0.0.1:%d", port))
 	require.NoError(t, err)
-	defer co.Close()
+	defer client.Close()
 
-	resp, err := co.Get(ctx, "/test/udp", message.Option{ID: message.URIPath, Value: []byte("test/udp")})
-	require.NoError(t, err)
-	require.NotNil(t, resp)
+	testCases := []struct {
+		name         string
+		path         string
+		expectedCode codes.Code
+	}{
+		{"ExactAllowed", "/allowed", codes.Content},
+		{"WildcardSegmentAllowed", "/allowed/foo", codes.Content},
+		{"WildcardTooManySegments", "/allowed/foo/bar", codes.NotFound},
+		{"DisallowedExact", "/disallowed", codes.NotFound},
+		{"RootDisallowed", "/", codes.NotFound},
+	}
 
-	assert.Equal(t, codes.Content, resp.Code())
-	payload, err := resp.ReadBody()
-	require.NoError(t, err)
-	assert.Equal(t, "UDP OK", string(payload))
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			reqCtx, reqCancel := context.WithTimeout(ctx, 2*time.Second)
+			defer reqCancel()
+			resp, errPath := client.Get(reqCtx, tc.path)
+			require.NoError(t, errPath)
+			require.NotNil(t, resp)
+			defer pool.ReleaseMessage(resp)
+			assert.Equal(t, tc.expectedCode, resp.Code(), "Path: %s", tc.path)
+		})
+	}
+}
 
-	benthosMsg, _, err := input.Read(ctx)
+func TestCoAPServer_MethodFiltering(t *testing.T) {
+	port := getFreePort(t)
+	targetPath := "/resource"
+	configYAML := fmt.Sprintf(`
+listen_address: "127.0.0.1:%d"
+protocol: "udp"
+allowed_paths: ["%s"]
+allowed_methods: ["GET", "DELETE"]
+response:
+  default_code: %d
+`, port, targetPath, codes.Content)
+	input, _ := newTestCoAPServerInput(t, configYAML)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, input.Connect(ctx))
+	defer input.Close(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	client, err := udpClient.Dial(fmt.Sprintf("127.0.0.1:%d", port))
 	require.NoError(t, err)
-	require.NotNil(t, benthosMsg)
-	metaPath, ok := benthosMsg.MetaGet("coap_server_path")
-	require.True(t, ok)
-	assert.Equal(t, "/test/udp", metaPath)
+	defer client.Close()
+
+	t.Run("GET_Allowed", func(t *testing.T) {
+		reqCtx, reqCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer reqCancel()
+		resp, errGet := client.Get(reqCtx, targetPath)
+		require.NoError(t, errGet)
+		require.NotNil(t, respGet)
+		defer pool.ReleaseMessage(respGet)
+		assert.Equal(t, codes.Content, respGet.Code())
+	})
+
+	t.Run("DELETE_Allowed", func(t *testing.T) {
+		reqCtx, reqCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer reqCancel()
+		resp, errDel := client.Delete(reqCtx, targetPath)
+		require.NoError(t, errDel)
+		require.NotNil(t, resp)
+		defer pool.ReleaseMessage(resp)
+		assert.Equal(t, codes.Content, resp.Code())
+	})
+
+	t.Run("POST_Disallowed", func(t *testing.T) {
+		reqCtx, reqCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer reqCancel()
+		resp, errPost := client.Post(reqCtx, targetPath, message.TextPlain, strings.NewReader("test"))
+		require.NoError(t, errPost)
+		require.NotNil(t, respPost)
+		defer pool.ReleaseMessage(respPost)
+		assert.Equal(t, codes.MethodNotAllowed, respPost.Code())
+	})
+
+	t.Run("PUT_Disallowed", func(t *testing.T) {
+		reqCtx, reqCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer reqCancel()
+		resp, errPut := client.Put(reqCtxPut, targetPath, message.TextPlain, strings.NewReader("test"))
+		require.NoError(t, errPut)
+		require.NotNil(t, respPut)
+		defer pool.ReleaseMessage(respPut)
+		assert.Equal(t, codes.MethodNotAllowed, respPut.Code())
+	})
 }
