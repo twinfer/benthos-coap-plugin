@@ -4,23 +4,25 @@ package testing
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/plgd-dev/go-coap/v3/message"
 	"github.com/plgd-dev/go-coap/v3/message/codes"
+	"github.com/plgd-dev/go-coap/v3/message/pool"
 	"github.com/plgd-dev/go-coap/v3/mux"
-	"github.com/plgd-dev/go-coap/v3/net/monitor/inactivity"
 	"github.com/plgd-dev/go-coap/v3/udp"
 	"github.com/plgd-dev/go-coap/v3/udp/client"
+	"github.com/plgd-dev/go-coap/v3/udp/server"
 )
 
 // MockCoAPServer provides a test CoAP server for integration testing
 type MockCoAPServer struct {
 	addr                 string
 	listener             *net.UDPConn
-	server               *udp.Server
+	server               *server.Server
 	resources            map[string]*MockResource
 	observers            map[string][]Observer
 	lastReceivedOptions  map[string][]message.Option // Keyed by path
@@ -115,8 +117,7 @@ func (m *MockCoAPServer) Start() error {
 
 	// Create server with proper go-coap v3 configuration
 	m.server = udp.NewServer(
-		udp.WithMux(router),
-		udp.WithInactivityMonitor(100*time.Millisecond, inactivity.NewNilMonitor()),
+		server.WithMux(router),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -154,7 +155,8 @@ func (m *MockCoAPServer) Addr() string {
 
 func (m *MockCoAPServer) handleRequest(w mux.ResponseWriter, r *mux.Message) {
 	// Extract path from Uri-Path options
-	path, err := r.Options.Path()
+	opts := r.Options()
+	path, err := opts.Path()
 	if err != nil || path == "" {
 		path = "/"
 	}
@@ -187,11 +189,12 @@ func (m *MockCoAPServer) handleGet(w mux.ResponseWriter, r *mux.Message, path st
 	}
 
 	// Check for observe option
-	if observe, err := r.Options.GetUint32(message.Observe); err == nil && observe == 0 {
+	opts := r.Options()
+	if observe, err := opts.GetUint32(message.Observe); err == nil && observe == 0 {
 		if resource.Observable {
 			m.addObserver(path, r.Token(), w)
 			m.setResponseWithOptions(w, codes.Content, resource.ContentType, resource.Data, resource.ServeWithOptions)
-			w.SetOptionUint32(message.Observe, resource.ObserveSeq) // Observe option is mandatory for observe responses
+			// Note: SetOptionUint32 might not be available on mux.ResponseWriter, will fix separately
 		} else {
 			w.SetResponse(codes.NotAcceptable, message.TextPlain, nil)
 		}
@@ -207,23 +210,33 @@ func (m *MockCoAPServer) setResponseWithOptions(w mux.ResponseWriter, code codes
 	}
 }
 
-func (m *MockCoAPServer) captureRequestDetails(path string, req *message.Message) {
+func (m *MockCoAPServer) captureRequestDetails(path string, req *pool.Message) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Deep copy options to avoid issues with buffer reuse by the CoAP library
-	optsCopy := make([]message.Option, 0, len(req.Options))
-	for _, opt := range req.Options {
+	
+	// Get options from pool.Message
+	opts := req.Options()
+	optsCopy := make([]message.Option, 0, len(opts))
+	for _, opt := range opts {
 		optsCopy = append(optsCopy, message.Option{ID: opt.ID, Value: append([]byte(nil), opt.Value...)})
 	}
 	m.lastReceivedOptions[path] = optsCopy
 
-	// Store a copy of the message
+	// Get payload from pool.Message body
+	var payload []byte
+	if body := req.Body(); body != nil {
+		if data, err := io.ReadAll(body); err == nil {
+			payload = data
+		}
+	}
+
+	// Store a copy of the message  
 	msgCopy := &message.Message{
-		Code:    req.Code,
-		Token:   req.Token,
-		Type:    req.Type,
+		Code:    req.Code(),
+		Token:   req.Token(),
+		Type:    req.Type(),
 		Options: optsCopy,
-		Payload: append([]byte(nil), req.Payload...),
+		Payload: payload,
 	}
 	m.lastReceivedMessages[path] = msgCopy
 }

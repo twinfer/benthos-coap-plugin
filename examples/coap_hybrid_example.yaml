@@ -1,0 +1,228 @@
+# Hybrid CoAP Configuration
+# This example shows how to use both client-side (observe) and server-side inputs
+# in a single Benthos instance to create a comprehensive CoAP gateway
+
+# Use broker input to combine multiple CoAP inputs
+input:
+  broker:
+    inputs:
+      # Client-side input: Connect to IoT devices and observe their resources
+      - coap:
+          endpoints:
+            - "coap://sensor1.local:5683"
+            - "coap://sensor2.local:5683"
+            - "coap://gateway.local:5683"
+          
+          observe_paths:
+            - "/sensors/temperature"
+            - "/sensors/humidity"
+            - "/sensors/pressure"
+            - "/status/health"
+          
+          protocol: "udp"
+          
+          connection:
+            pool_size: 5
+            health_check_interval: "30s"
+            max_idle_time: "5m"
+          
+          retry_policy:
+            max_retries: 3
+            initial_interval: "1s"
+            max_interval: "30s"
+            multiplier: 2.0
+            jitter: true
+          
+          circuit_breaker:
+            enabled: true
+            failure_threshold: 5
+            success_threshold: 3
+            timeout: "30s"
+            half_open_max_calls: 2
+          
+          converter:
+            default_content_format: "application/json"
+            preserve_options: true
+      
+      # Server-side input: Act as a CoAP server for external clients
+      - coap_server:
+          listen_address: "0.0.0.0:5683"
+          protocol: "udp"
+          
+          # Accept requests for specific API endpoints
+          allowed_paths:
+            - "/api/v1/data"
+            - "/api/v1/command"
+            - "/webhook/coap"
+            - "/bridge/sensors"
+          
+          allowed_methods:
+            - "GET" 
+            - "POST"
+            - "PUT"
+          
+          buffer_size: 500
+          timeout: "10s"
+          
+          response:
+            default_content_format: "application/json"
+            default_code: 69  # Content (2.05)
+            default_payload: '{"status": "accepted"}'
+          
+          converter:
+            preserve_options: true
+
+# Advanced processing pipeline
+pipeline:
+  processors:
+    # Add common metadata
+    - mutation: |
+        root.timestamp = now()
+        root.instance_id = hostname()
+    
+    # Differentiate between client and server sources
+    - branch:
+        request_map: 'root'
+        processors:
+          # Tag messages from CoAP observe (client-side)
+          - conditional:
+              condition: 'meta().has("coap_observe_sequence")'
+              processors:
+                - mutation: |
+                    root.source_type = "coap_observe"
+                    root.source_info = {
+                      "endpoint": meta("coap_endpoint").or("unknown"),
+                      "resource_path": meta("coap_uri_path").or("unknown"),
+                      "observe_sequence": meta("coap_observe_sequence").or(0),
+                      "token": meta("coap_token").or("")
+                    }
+          
+          # Tag messages from CoAP server requests
+          - conditional:
+              condition: 'meta().has("coap_server_method")'
+              processors:
+                - mutation: |
+                    root.source_type = "coap_server"
+                    root.source_info = {
+                      "method": meta("coap_server_method"),
+                      "path": meta("coap_server_path"),
+                      "protocol": meta("coap_server_protocol"),
+                      "client_timestamp": meta("coap_server_timestamp")
+                    }
+    
+    # Content-based routing and enrichment
+    - switch:
+        - check: 'this.source_type == "coap_observe"'
+          processors:
+            # Process sensor observations
+            - mutation: |
+                root.message_type = "sensor_data"
+                root.device_id = this.source_info.endpoint.split(":").index(0)
+                root.sensor_type = this.source_info.resource_path.trim_prefix("/sensors/")
+            
+            # Validate sensor data structure
+            - conditional:
+                condition: 'this.exists("temperature") || this.exists("humidity") || this.exists("pressure")'
+                processors:
+                  - mutation: |
+                      root.data_valid = true
+                      if this.exists("temperature") {
+                        root.sensor_readings.temperature = {
+                          "value": this.temperature,
+                          "unit": "celsius",
+                          "timestamp": this.timestamp
+                        }
+                      }
+                      if this.exists("humidity") {
+                        root.sensor_readings.humidity = {
+                          "value": this.humidity, 
+                          "unit": "percent",
+                          "timestamp": this.timestamp
+                        }
+                      }
+                      if this.exists("pressure") {
+                        root.sensor_readings.pressure = {
+                          "value": this.pressure,
+                          "unit": "hPa", 
+                          "timestamp": this.timestamp
+                        }
+                      }
+        
+        - check: 'this.source_type == "coap_server"'
+          processors:
+            # Process API requests
+            - mutation: |
+                root.message_type = "api_request"
+                root.api_path = this.source_info.path
+                root.http_method = this.source_info.method
+            
+            # Handle different API endpoints
+            - switch:
+                - check: 'this.source_info.path.has_prefix("/api/v1/")'
+                  processors:
+                    - mutation: |
+                        root.api_version = "v1"
+                        root.api_endpoint = this.source_info.path.trim_prefix("/api/v1/")
+                
+                - check: 'this.source_info.path.has_prefix("/webhook/")'
+                  processors:
+                    - mutation: |
+                        root.message_type = "webhook"
+                        root.webhook_type = this.source_info.path.trim_prefix("/webhook/")
+
+# Smart output routing
+output:
+  broker:
+    pattern: "fan_out"
+    outputs:
+      # Store all sensor data in time-series database
+      - conditional:
+          condition: 'this.message_type == "sensor_data" && this.data_valid == true'
+          output:
+            file:
+              path: "./sensor_data.jsonl"
+              codec: "lines"
+      
+      # Store API requests for analysis
+      - conditional:
+          condition: 'this.message_type == "api_request"'
+          output:
+            file:
+              path: "./api_requests.jsonl" 
+              codec: "lines"
+      
+      # Real-time monitoring output
+      - conditional:
+          condition: 'this.exists("sensor_readings")'
+          output:
+            stdout:
+              codec: "lines"
+      
+      # Webhook processing
+      - conditional:
+          condition: 'this.message_type == "webhook"'
+          output:
+            http_client:
+              url: "http://localhost:8080/process-webhook"
+              verb: "POST"
+              headers:
+                Content-Type: "application/json"
+                X-Source: "benthos-coap"
+
+# Comprehensive metrics
+metrics:
+  prometheus:
+    use_histogram_timing: true
+    histogram_buckets: [.001, .005, .01, .025, .05, .1, .25, .5, 1.0, 2.5, 5.0]
+    add_process_metrics: true
+    add_go_metrics: true
+
+# Structured logging
+logger:
+  level: "INFO"
+  format: "json"
+  add_timestamp: true
+  static_fields:
+    service: "coap-hybrid-gateway"
+    version: "1.0.0"
+    deployment: "production"

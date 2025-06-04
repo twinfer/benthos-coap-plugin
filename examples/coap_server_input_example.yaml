@@ -1,0 +1,132 @@
+# Example configuration for CoAP server input plugin
+# This configuration sets up Benthos to act as a CoAP server
+# receiving requests from CoAP clients
+
+# CoAP Server Input Configuration
+input:
+  coap_server:
+    # Address to listen on for incoming CoAP requests
+    listen_address: "0.0.0.0:5683"
+    
+    # Protocol to use for the server (udp, tcp, udp-dtls, tcp-tls)
+    protocol: "udp"
+    
+    # Optional: Restrict which resource paths are allowed
+    # Empty list means allow all paths
+    allowed_paths:
+      - "/api/data"
+      - "/sensors/temperature" 
+      - "/sensors/humidity"
+      - "/actuators/led"
+    
+    # Optional: Restrict which HTTP methods are allowed
+    # Empty list means allow all methods
+    allowed_methods:
+      - "GET"
+      - "POST"
+      - "PUT"
+      - "DELETE"
+    
+    # Buffer size for incoming messages
+    buffer_size: 1000
+    
+    # Timeout for processing individual requests
+    timeout: "30s"
+    
+    # Security configuration
+    security:
+      mode: "none"  # Options: none, psk, certificate
+      # For PSK mode:
+      # psk_identity: "client1"
+      # psk_key: "secretkey123"
+      # For certificate mode:
+      # cert_file: "/path/to/server.crt"
+      # key_file: "/path/to/server.key"
+      # ca_cert_file: "/path/to/ca.crt"
+      # require_client_cert: true
+    
+    # Default response configuration
+    response:
+      default_content_format: "text/plain"
+      default_code: 69  # Content (2.05)
+      default_payload: "OK"
+    
+    # Message conversion configuration
+    converter:
+      default_content_format: "application/json"
+      compression_enabled: true
+      max_payload_size: 1048576  # 1MB
+      preserve_options: true
+
+# Processing pipeline
+pipeline:
+  processors:
+    # Add processing timestamp
+    - mutation: |
+        root.processed_at = now()
+        root.server_info = {
+          "protocol": meta("coap_server_protocol"),
+          "method": meta("coap_server_method"), 
+          "path": meta("coap_server_path"),
+          "timestamp": meta("coap_server_timestamp")
+        }
+    
+    # Route based on CoAP method and path
+    - branch:
+        request_map: |
+          root.method = meta("coap_server_method")
+          root.path = meta("coap_server_path")
+        processors:
+          # Handle sensor data (GET requests)
+          - conditional:
+              condition: 'this.method == "GET" && this.path.has_prefix("/sensors/")'
+              processors:
+                - mutation: |
+                    root.type = "sensor_reading"
+                    root.sensor_id = this.path.trim_prefix("/sensors/")
+          
+          # Handle actuator commands (POST/PUT requests)  
+          - conditional:
+              condition: 'this.method.or("").re_match("POST|PUT") && this.path.has_prefix("/actuators/")'
+              processors:
+                - mutation: |
+                    root.type = "actuator_command"
+                    root.actuator_id = this.path.trim_prefix("/actuators/")
+          
+          # Handle API data
+          - conditional:
+              condition: 'this.path.has_prefix("/api/")'
+              processors:
+                - mutation: |
+                    root.type = "api_request"
+                    root.api_endpoint = this.path
+
+# Output configuration - route to different destinations
+output:
+  switch:
+    - check: 'meta("coap_server_method") == "GET"'
+      output:
+        stdout:
+          codec: "lines"
+        
+    - output:
+        file:
+          path: "./coap_requests.jsonl"
+          codec: "lines"
+
+# Metrics and monitoring
+metrics:
+  prometheus:
+    use_histogram_timing: true
+    histogram_buckets: [.005, .01, .025, .05, .1, .25, .5, 1.0, 2.5, 5.0, 10.0]
+    add_process_metrics: true
+    add_go_metrics: true
+
+# Logging configuration  
+logger:
+  level: "INFO"
+  format: "json"
+  add_timestamp: true
+  static_fields:
+    service: "coap-server"
+    version: "1.0.0"
