@@ -77,6 +77,10 @@ func init() {
 			service.NewBoolField("confirmable").
 				Description("Send confirmable messages requiring acknowledgment.").
 				Default(true),
+			service.NewStringField("default_method").
+				Description("Default CoAP method if not specified in message metadata.").
+				Default("POST").
+				LintRule("root in ['GET', 'POST', 'PUT', 'DELETE']"),
 			service.NewDurationField("timeout").
 				Description("Request timeout for confirmable messages.").
 				Default("30s"),
@@ -154,6 +158,7 @@ type OutputConfig struct {
 
 type RequestOptions struct {
 	Confirmable      bool
+	DefaultMethod    string
 	Timeout          time.Duration
 	ContentFormat    string
 	AutoDetectFormat bool
@@ -312,7 +317,8 @@ func (o *Output) WriteWithRetry(ctx context.Context, msg *service.Message, retry
 	}
 
 	// Send CoAP request
-	err = o.sendCoAPMessage(ctx, conn, coapMsg, path) // Pass path for logging
+	// Pass original Benthos message to sendCoAPMessage for metadata access
+	err = o.sendCoAPMessage(ctx, conn, msg, coapMsg, path)
 	if err != nil {
 		if retryCount < o.config.RetryPolicy.MaxRetries {
 			o.metrics.RetriesTotal.Incr(1)
@@ -349,8 +355,7 @@ func (o *Output) WriteWithRetry(ctx context.Context, msg *service.Message, retry
 	return nil
 }
 
-func (o *Output) sendCoAPMessage(ctx context.Context, connWrapper *connection.ConnectionWrapper, coapMsg *message.Message, path string) error {
-	// Note: We'll implement proper request handling with timeouts in go-coap v3 later
+func (o *Output) sendCoAPMessage(ctx context.Context, connWrapper *connection.ConnectionWrapper, originalBenthosMsg *service.Message, coapMsg *message.Message, path string) error {
 
 	endpoint := connWrapper.Endpoint()
 	tokenStr := ""
@@ -374,9 +379,9 @@ func (o *Output) sendCoAPMessage(ctx context.Context, connWrapper *connection.Co
 
 	switch c := rawConn.(type) {
 	case *udpClient.Conn: // Handles UDP and DTLS
-		return o.sendUDPMessage(reqCtx, c, coapMsg, endpoint, path, tokenStr)
+		return o.sendUDPMessage(reqCtx, c, originalBenthosMsg, coapMsg, endpoint, path, tokenStr)
 	case *tcpClient.Conn: // Handles TCP and TCP-TLS
-		return o.sendTCPMessage(reqCtx, c, coapMsg, endpoint, path, tokenStr)
+		return o.sendTCPMessage(reqCtx, c, originalBenthosMsg, coapMsg, endpoint, path, tokenStr)
 	default:
 		o.metrics.MessagesFailed.Incr(1)
 		return fmt.Errorf("unsupported connection type for CoAP output: %T (protocol: %s)", rawConn, protocol)
@@ -384,12 +389,23 @@ func (o *Output) sendCoAPMessage(ctx context.Context, connWrapper *connection.Co
 }
 
 // sendUDPMessage sends a CoAP message using a UDP client connection.
-func (o *Output) sendUDPMessage(ctx context.Context, conn *udpClient.Conn, coapMsg *message.Message, endpoint, path, tokenStr string) error {
+func (o *Output) sendUDPMessage(ctx context.Context, conn *udpClient.Conn, originalBenthosMsg *service.Message, coapMsg *message.Message, endpoint, path, tokenStr string) error {
 	// Create a standalone message (no pool release needed)
 	req := pool.NewMessage(ctx)
 
+	// Determine CoAP method
+	methodStr, _ := originalBenthosMsg.MetaGet("coap_method")
+	if methodStr == "" {
+		methodStr = o.config.RequestOptions.DefaultMethod
+	}
+	coapCode, err := methodStringToCode(methodStr)
+	if err != nil {
+		o.logger.Warnf("Invalid CoAP method '%s' for endpoint %s: %v. Defaulting to POST.", methodStr, endpoint, err)
+		coapCode = codes.POST
+	}
+
 	// Set basic message properties
-	req.SetCode(codes.POST) // Default to POST
+	req.SetCode(coapCode)
 	req.SetType(coapMsg.Type)
 	req.SetToken(coapMsg.Token)
 
@@ -445,12 +461,23 @@ func (o *Output) sendUDPMessage(ctx context.Context, conn *udpClient.Conn, coapM
 }
 
 // sendTCPMessage sends a CoAP message using a TCP client connection.
-func (o *Output) sendTCPMessage(ctx context.Context, conn *tcpClient.Conn, coapMsg *message.Message, endpoint, path, tokenStr string) error {
+func (o *Output) sendTCPMessage(ctx context.Context, conn *tcpClient.Conn, originalBenthosMsg *service.Message, coapMsg *message.Message, endpoint, path, tokenStr string) error {
 	// Create a standalone message (no pool release needed)
 	req := pool.NewMessage(ctx)
 
+	// Determine CoAP method
+	methodStr, _ := originalBenthosMsg.MetaGet("coap_method")
+	if methodStr == "" {
+		methodStr = o.config.RequestOptions.DefaultMethod
+	}
+	coapCode, err := methodStringToCode(methodStr)
+	if err != nil {
+		o.logger.Warnf("Invalid CoAP method '%s' for endpoint %s: %v. Defaulting to POST.", methodStr, endpoint, err)
+		coapCode = codes.POST
+	}
+
 	// Set basic message properties
-	req.SetCode(codes.POST) // Default to POST
+	req.SetCode(coapCode)
 	req.SetType(coapMsg.Type)
 	req.SetToken(coapMsg.Token)
 
@@ -654,6 +681,10 @@ func parseRequestOptions(conf *service.ParsedConfig) (RequestOptions, error) {
 	if err != nil {
 		return RequestOptions{}, fmt.Errorf("failed to parse request_options.confirmable: %w", err)
 	}
+	defaultMethod, err := conf.FieldString("request_options", "default_method")
+	if err != nil {
+		return RequestOptions{}, fmt.Errorf("failed to parse request_options.default_method: %w", err)
+	}
 	timeout, err := conf.FieldDuration("request_options", "timeout")
 	if err != nil {
 		return RequestOptions{}, fmt.Errorf("failed to parse request_options.timeout: %w", err)
@@ -665,6 +696,7 @@ func parseRequestOptions(conf *service.ParsedConfig) (RequestOptions, error) {
 
 	opts := RequestOptions{
 		Confirmable:      confirmable,
+		DefaultMethod:    defaultMethod,
 		Timeout:          timeout,
 		AutoDetectFormat: autoDetectFormat,
 	}
@@ -673,6 +705,22 @@ func parseRequestOptions(conf *service.ParsedConfig) (RequestOptions, error) {
 		opts.ContentFormat = contentFormat
 	}
 	return opts, nil
+}
+
+// Helper function to convert method string to CoAP code
+func methodStringToCode(method string) (codes.Code, error) {
+	switch method {
+	case "GET":
+		return codes.GET, nil
+	case "POST":
+		return codes.POST, nil
+	case "PUT":
+		return codes.PUT, nil
+	case "DELETE":
+		return codes.DELETE, nil
+	default:
+		return codes.Empty, fmt.Errorf("unsupported CoAP method: %s", method)
+	}
 }
 
 func parseOutputRetryPolicy(conf *service.ParsedConfig) (RetryPolicy, error) {
