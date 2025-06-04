@@ -13,6 +13,8 @@ import (
 	"github.com/plgd-dev/go-coap/v3/message/codes"
 	"github.com/plgd-dev/go-coap/v3/message/pool"
 	"github.com/plgd-dev/go-coap/v3/mux"
+	coapNet "github.com/plgd-dev/go-coap/v3/net" // Add this import
+	"github.com/plgd-dev/go-coap/v3/options"
 	"github.com/plgd-dev/go-coap/v3/udp"
 	"github.com/plgd-dev/go-coap/v3/udp/client"
 	"github.com/plgd-dev/go-coap/v3/udp/server"
@@ -21,7 +23,7 @@ import (
 // MockCoAPServer provides a test CoAP server for integration testing
 type MockCoAPServer struct {
 	addr                 string
-	listener             *net.UDPConn
+	listener             *coapNet.UDPConn // Use the go-coap specific UDPConn type
 	server               *server.Server
 	resources            map[string]*MockResource
 	observers            map[string][]Observer
@@ -30,6 +32,14 @@ type MockCoAPServer struct {
 	mu                   sync.RWMutex
 	running              bool
 	cancel               context.CancelFunc
+}
+
+// responseWriterWithOptions is a local interface to allow setting options on the ResponseWriter.
+// This is a workaround because mux.ResponseWriter interface in v3.3.6 doesn't expose SetOptionBytes,
+// but the concrete implementations passed by the server do.
+type responseWriterWithOptions interface {
+	mux.ResponseWriter
+	SetOptionBytes(id message.OptionID, value []byte) error
 }
 
 type MockResource struct {
@@ -104,7 +114,9 @@ func (m *MockCoAPServer) UpdateResource(path string, data []byte, newOpts ...mes
 }
 
 func (m *MockCoAPServer) Start() error {
-	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	// Create the address string for NewListenUDP
+	listenAddrStr := (&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}).String()
+	listener, err := coapNet.NewListenUDP("udp", listenAddrStr)
 	if err != nil {
 		return fmt.Errorf("failed to create UDP listener: %w", err)
 	}
@@ -116,14 +128,14 @@ func (m *MockCoAPServer) Start() error {
 	router.Handle("/", mux.HandlerFunc(m.handleRequest))
 
 	// Create server with proper go-coap v3 configuration
-	m.server = udp.NewServer(
-		server.WithMux(router),
+	m.server = server.New( // Use the 'server' alias for github.com/plgd-dev/go-coap/v3/udp/server
+		options.WithMux(router), // WithMux is in the 'options' package
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 
-	go func() {
+	go func() { // Serve blocks, run in goroutine
 		if err := m.server.Serve(listener); err != nil && ctx.Err() == nil {
 			fmt.Printf("CoAP server error: %v\n", err)
 		}
@@ -143,9 +155,6 @@ func (m *MockCoAPServer) Stop() error {
 		m.cancel()
 	}
 
-	if m.server != nil {
-		return m.server.Close()
-	}
 	return nil
 }
 
@@ -190,23 +199,60 @@ func (m *MockCoAPServer) handleGet(w mux.ResponseWriter, r *mux.Message, path st
 
 	// Check for observe option
 	opts := r.Options()
-	if observe, err := opts.GetUint32(message.Observe); err == nil && observe == 0 {
+	if observeVal, err := opts.GetUint32(message.Observe); err == nil && observeVal == 0 { // Observe registration
 		if resource.Observable {
 			m.addObserver(path, r.Token(), w)
+			// Send initial response with Observe option
 			m.setResponseWithOptions(w, codes.Content, resource.ContentType, resource.Data, resource.ServeWithOptions)
-			// Note: SetOptionUint32 might not be available on mux.ResponseWriter, will fix separately
+
+			// Assert to our local interface that includes SetOptionBytes
+			rw, ok := w.(responseWriterWithOptions)
+			if !ok {
+				fmt.Printf("MockCoAPServer: ResponseWriter does not implement SetOptionBytes for Observe option\n")
+				return // Cannot set Observe option
+			}
+
+			// Encode Observe sequence number (uint32) to bytes using a buffer
+			buf := make([]byte, 4) // Max size for uint32 CoAP encoding (CoAP spec)
+			resultBuffer, bytesWritten := message.EncodeUint32(buf, resource.ObserveSeq)
+			obsBytes := resultBuffer[:bytesWritten] // Use the byte slice and the count correctly
+			if err := w.SetOptionBytes(message.Observe, obsBytes); err != nil {
+				fmt.Printf("MockCoAPServer: failed to set Observe option (bytes) on initial GET for path %s: %v\n", path, err)
+			} else {
+				fmt.Printf("MockCoAPServer: Successfully set Observe option (seq: %d) on initial GET for path %s\n", resource.ObserveSeq, path)
+			}
 		} else {
-			w.SetResponse(codes.NotAcceptable, message.TextPlain, nil)
+			// Resource is not observable
+			if err := w.SetResponse(codes.NotAcceptable, message.TextPlain, nil); err != nil {
+				fmt.Printf("MockCoAPServer: failed to set NotAcceptable response for non-observable GET on path %s: %v\n", path, err)
+			}
 		}
-	} else {
+	} else { // Regular GET
 		m.setResponseWithOptions(w, codes.Content, resource.ContentType, resource.Data, resource.ServeWithOptions)
 	}
 }
 
 func (m *MockCoAPServer) setResponseWithOptions(w mux.ResponseWriter, code codes.Code, ct message.MediaType, payload []byte, opts []message.Option) {
-	w.SetResponse(code, ct, payload)
+	// Assert to our local interface that includes SetOptionBytes
+	rw, ok := w.(responseWriterWithOptions)
+	if !ok {
+		// This should not happen with go-coap v3.3.6 server implementations,
+		// but handle defensively.
+		fmt.Printf("MockCoAPServer: ResponseWriter does not implement SetOptionBytes\n")
+		// Still try to set the basic response
+		if err := w.SetResponse(code, ct, payload); err != nil {
+			fmt.Printf("MockCoAPServer: error setting response (code: %v, path: %s): %v\n", code, w.Conn().Request().URIPath(), err)
+		}
+		return
+	}
+
+	if err := rw.SetResponse(code, ct, payload); err != nil {
+		fmt.Printf("MockCoAPServer: error setting response (code: %v, path: %s): %v\n", code, w.Conn().Request().URIPath(), err)
+	}
 	for _, opt := range opts {
-		w.SetOptionBytes(opt.ID, opt.Value)
+		if err := w.SetOptionBytes(opt.ID, opt.Value); err != nil {
+			fmt.Printf("MockCoAPServer: error setting option (ID: %v, path: %s): %v\n", opt.ID, w.Conn().Request().URIPath(), err)
+		}
 	}
 }
 
@@ -243,12 +289,19 @@ func (m *MockCoAPServer) captureRequestDetails(path string, req *pool.Message) {
 
 func (m *MockCoAPServer) handlePost(w mux.ResponseWriter, r *mux.Message, path string) {
 	m.mu.Lock()
+	// Deep copy options from the request
+	reqOpts := r.Options()
+	optsCopy := make([]message.Option, 0, len(reqOpts))
+	for _, opt := range reqOpts {
+		optsCopy = append(optsCopy, message.Option{ID: opt.ID, Value: append([]byte(nil), opt.Value...)})
+	}
+
 	resource, exists := m.resources[path]
 	if !exists { // If resource doesn't exist, create it (typical POST behavior)
 		resource = &MockResource{Path: path, Observable: false} // Default to not observable for POST-created
 		m.resources[path] = resource
 	}
-	resource.LastPutOrPostOptions = r.Options // Store options from this request
+	resource.LastPutOrPostOptions = optsCopy // Store copied options
 	m.mu.Unlock()
 
 	data := r.Payload
@@ -272,13 +325,20 @@ func (m *MockCoAPServer) handlePost(w mux.ResponseWriter, r *mux.Message, path s
 
 func (m *MockCoAPServer) handlePut(w mux.ResponseWriter, r *mux.Message, path string) {
 	m.mu.Lock()
+	// Deep copy options from the request
+	reqOpts := r.Options()
+	optsCopy := make([]message.Option, 0, len(reqOpts))
+	for _, opt := range reqOpts {
+		optsCopy = append(optsCopy, message.Option{ID: opt.ID, Value: append([]byte(nil), opt.Value...)})
+	}
+
 	resource, exists := m.resources[path]
 	if !exists {
 		// PUT usually updates or creates if not present at a specific known URI
 		resource = &MockResource{Path: path, Observable: false}
 		m.resources[path] = resource
 	}
-	resource.LastPutOrPostOptions = r.Options
+	resource.LastPutOrPostOptions = optsCopy // Store copied options
 	m.mu.Unlock()
 
 	data := r.Payload
@@ -334,8 +394,25 @@ func (m *MockCoAPServer) sendObserveNotification(observer *Observer, resource *M
 	}
 
 	// Set all options defined for the resource, then override with Observe
+	// The ResponseWriter (w) for an observer is the one from the initial GET request.
 	m.setResponseWithOptions(observer.Response, codes.Content, resource.ContentType, resource.Data, resource.ServeWithOptions)
-	observer.Response.SetOptionUint32(message.Observe, resource.ObserveSeq) // Ensure Observe option is set for notification
+
+	// Assert to our local interface that includes SetOptionBytes
+	rw, ok := observer.Response.(responseWriterWithOptions)
+	if !ok {
+		fmt.Printf("MockCoAPServer: Observer ResponseWriter does not implement SetOptionBytes for notification\n")
+		return // Cannot set Observe option on notification
+	}
+
+	// Encode Observe sequence number (uint32) to bytes using a buffer
+	buf := make([]byte, 4) // Max size for uint32 CoAP encoding (CoAP spec)
+	resultBuffer, bytesWritten := message.EncodeUint32(buf, resource.ObserveSeq)
+	obsBytes := resultBuffer[:bytesWritten] // Use the byte slice and the count correctly
+	if err := observer.Response.SetOptionBytes(message.Observe, obsBytes); err != nil {
+		fmt.Printf("MockCoAPServer: error setting Observe option (bytes) on notification for path %s: %v\n", resource.Path, err)
+	} else {
+		fmt.Printf("MockCoAPServer: Successfully set Observe option (seq: %d) on notification for path %s\n", resource.ObserveSeq, resource.Path)
+	}
 }
 
 // Test utilities

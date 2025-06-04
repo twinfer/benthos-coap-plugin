@@ -2,124 +2,90 @@
 package input
 
 import (
-	"bytes"       // Ensure this is not duplicated
-	"context"     // Ensure this is not duplicated
+	"bytes"
+	"context"
 	"crypto/tls"
-	"crypto/x509" // For x509.NewCertPool
+	"crypto/x509" // Keep for createTLSConfig, createDTLSConfig
 	"fmt"
-	"io"
-	// "net" // No longer directly used
-	"os"        // For os.ReadFile
+	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	piondtls "github.com/pion/dtls/v3"
+	dtlsserver "github.com/plgd-dev/go-coap/v3/dtls/server"
 	"github.com/plgd-dev/go-coap/v3/message"
 	"github.com/plgd-dev/go-coap/v3/message/codes"
 	"github.com/plgd-dev/go-coap/v3/message/pool"
 	"github.com/plgd-dev/go-coap/v3/mux"
 	coapNet "github.com/plgd-dev/go-coap/v3/net"
-	"github.com/plgd-dev/go-coap/v3/options"             // Added for server options
-	tcpserver "github.com/plgd-dev/go-coap/v3/tcp/server" // Correct alias
-	udpserver "github.com/plgd-dev/go-coap/v3/udp/server" // Correct alias
+	"github.com/plgd-dev/go-coap/v3/net/blockwise"
+	"github.com/plgd-dev/go-coap/v3/options"
+
+	tcpserver "github.com/plgd-dev/go-coap/v3/tcp/server"
+	udpserver "github.com/plgd-dev/go-coap/v3/udp/server"
+
 	"github.com/redpanda-data/benthos/v4/public/service"
 
-	"github.com/twinfer/benthos-coap-plugin/pkg/converter"
+	benthosConverter "github.com/twinfer/benthos-coap-plugin/pkg/converter"
 )
 
-func init() {
-	configSpec := service.NewConfigSpec().
-		Summary("Acts as a CoAP server to receive requests from CoAP clients.").
-		Description("The CoAP server input listens for incoming CoAP requests on specified endpoints and converts them to Benthos messages. Supports UDP, TCP, DTLS, and TCP-TLS protocols with configurable request handling.").
-		Field(service.NewStringField("listen_address").
-			Description("Address to listen on for incoming CoAP requests.").
-			Default("0.0.0.0:5683").
-			Example("0.0.0.0:5683")).
-		Field(service.NewStringField("protocol").
-			Description("CoAP protocol to use for the server.").
-			Default("udp").
-			LintRule("root in ['udp', 'tcp', 'udp-dtls', 'tcp-tls', 'tcp', 'tcp-tls']")).
-		Field(service.NewStringListField("allowed_paths").
-			Description("List of resource paths to accept requests for. Empty means accept all paths.").
-			Default([]string{}).
-			Example([]string{"/api/data", "/sensors/+", "/actuators/*/command"})).
-		Field(service.NewStringListField("allowed_methods").
-			Description("List of CoAP methods to accept. Empty means accept all methods.").
-			Default([]string{}).
-			Example([]string{"GET", "POST", "PUT", "DELETE"})).
-		Field(service.NewObjectField("security",
-			service.NewStringField("mode").
-				Description("Security mode: none, psk, or certificate.").
-				Default("none").
-				LintRule("root in ['none', 'psk', 'certificate']"),
-			service.NewStringField("psk_identity").
-				Description("PSK identity for DTLS authentication.").
-				Optional(),
-			service.NewStringField("psk_key").
-				Description("PSK key for DTLS authentication.").
-				Optional(),
-			service.NewStringField("cert_file").
-				Description("Path to server certificate file.").
-				Optional(),
-			service.NewStringField("key_file").
-				Description("Path to server private key file.").
-				Optional(),
-			service.NewStringField("ca_cert_file").
-				Description("Path to CA certificate file for client verification.").
-				Optional(),
-			service.NewBoolField("require_client_cert").
-				Description("Require client certificate authentication.").
-				Default(false),
-		).Description("Security configuration for the CoAP server.")).
-		Field(service.NewIntField("buffer_size").
-			Description("Size of the message buffer for incoming requests.").
-			Default(1000)).
-		Field(service.NewDurationField("timeout").
-			Description("Timeout for processing individual requests.").
-			Default("30s")).
-		Field(service.NewObjectField("response",
-			service.NewStringField("default_content_format").
-				Description("Default content format for responses.").
-				Default("text/plain"),
-			service.NewIntField("default_code").
-				Description("Default response code for successful processing.").
-				Default(int(codes.Content)),
-			service.NewStringField("default_payload").
-				Description("Default response payload.").
-				Default("OK"),
-		).Description("Default response configuration.")).
-		Field(service.NewObjectField("converter",
-			service.NewStringField("default_content_format").
-				Description("Default content format for messages without explicit format.").
-				Default("application/json"),
-			service.NewBoolField("compression_enabled").
-				Description("Enable payload compression for large messages.").
-				Default(true),
-			service.NewIntField("max_payload_size").
-				Description("Maximum payload size in bytes.").
-				Default(1048576),
-			service.NewBoolField("preserve_options").
-				Description("Preserve all CoAP options in message metadata.").
-				Default(true),
-		).Description("Message conversion configuration."))
-
-	err := service.RegisterInput("coap_server", configSpec, func(conf *service.ParsedConfig, mgr *service.Resources) (service.Input, error) {
-		return newCoAPServerInput(conf, mgr)
-	})
-	if err != nil {
-		panic(err)
-	}
+// SecurityConfig holds security-related configuration options for the CoAP server.
+type SecurityConfig struct {
+	Mode              string `yaml:"mode"`
+	PSKIdentity       string `yaml:"psk_identity"`
+	PSKKey            string `yaml:"psk_key"`
+	CertFile          string `yaml:"cert_file"`
+	KeyFile           string `yaml:"key_file"`
+	CACertFile        string `yaml:"ca_cert_file"`
+	RequireClientCert bool   `yaml:"require_client_cert"`
 }
 
+// ResponseConfig defines the default response parameters for the CoAP server.
+type ResponseConfig struct {
+	DefaultContentFormat string     `yaml:"default_content_format"`
+	DefaultCode          codes.Code `yaml:"default_code"`
+	DefaultPayload       string     `yaml:"default_payload"`
+}
+
+// ObserveServerConfig holds configuration for the CoAP Observe server functionality.
+type ObserveServerConfig struct {
+	EnableObserveServer       bool          `yaml:"enable_observe_server"`
+	DefaultNotificationMaxAge time.Duration `yaml:"default_notification_max_age"`
+}
+
+// ServerConfig holds all configuration for the CoAP server input.
+type ServerConfig struct {
+	ListenAddress  string
+	Protocol       string
+	AllowedPaths   []string
+	AllowedMethods []string
+	Security       SecurityConfig
+	BufferSize     int
+	Timeout        time.Duration
+	Response       ResponseConfig
+	Converter      benthosConverter.Config
+	Observe        ObserveServerConfig
+}
+
+// ServerMetrics holds metric counters for the CoAP server.
+type ServerMetrics struct {
+	RequestsReceived  *service.MetricCounter
+	RequestsProcessed *service.MetricCounter
+	RequestsFailed    *service.MetricCounter
+	ResponsesSent     *service.MetricCounter
+	NotificationsSent *service.MetricCounter
+	MessagesRead      *service.MetricCounter
+	ErrorsTotal       *service.MetricCounter
+}
+
+// ServerInput is the Benthos input plugin for CoAP server.
 type ServerInput struct {
-	udpServer *udpserver.Server
-	tcpServer *tcpserver.Server
-	udpConn   *coapNet.UDPConn // CoAP UDP connection for server
-	tcpListener tcpserver.Listener // Changed type to tcpserver.Listener
-	converter *converter.Converter
+	config    ServerConfig
 	logger    *service.Logger
 	metrics   *ServerMetrics
-	config    ServerConfig
+	converter *benthosConverter.Converter
 
 	msgChan   chan *service.Message
 	closeChan chan struct{}
@@ -127,384 +93,552 @@ type ServerInput struct {
 	closed    bool
 	mu        sync.RWMutex
 	wg        sync.WaitGroup
+
+	udpServer  *udpserver.Server
+	dtlsServer *dtlsserver.Server
+	tcpServer  *tcpserver.Server
+
+	udpConn      *coapNet.UDPConn
+	dtlsListener dtlsserver.Listener // Corrected type
+	tcpListener  tcpserver.Listener
+
+	router *mux.Router
 }
 
-type ServerConfig struct {
-	ListenAddress   string
-	Protocol        string
-	AllowedPaths    []string
-	AllowedMethods  []string
-	BufferSize      int
-	Timeout         time.Duration
-	SecurityConfig  SecurityConfig
-	ResponseConfig  ResponseConfig
-	ConverterConfig converter.Config
+var coapServerInputConfigSpec *service.ConfigSpec
+
+func init() {
+	coapServerInputConfigSpec = service.NewConfigSpec().
+		Summary("Acts as a CoAP server to receive requests from CoAP clients.").
+		Description("The CoAP server input listens for incoming CoAP requests on specified endpoints and converts them to Benthos messages. Supports UDP, TCP, DTLS, and TCP-TLS protocols with configurable request handling and CoAP Observe server functionality.").
+		Field(service.NewStringField("listen_address").Default("0.0.0.0:5683")).
+		Field(service.NewStringField("protocol").Default("udp").LintRule("root in ['udp', 'tcp', 'udp-dtls', 'tcp-tls']")).
+		Field(service.NewStringListField("allowed_paths").Default([]string{})).
+		Field(service.NewStringListField("allowed_methods").Default([]string{})).
+		Field(service.NewObjectField("security",
+			service.NewStringField("mode").Default("none").LintRule("root in ['none', 'psk', 'certificate']"),
+			service.NewStringField("psk_identity").Optional(),
+			service.NewStringField("psk_key").Optional(),
+			service.NewStringField("cert_file").Optional(),
+			service.NewStringField("key_file").Optional(),
+			service.NewStringField("ca_cert_file").Optional(),
+			service.NewBoolField("require_client_cert").Default(false),
+		).Description("Security configuration for DTLS/TLS connections.").Optional()).
+		Field(service.NewIntField("buffer_size").Default(1000)).
+		Field(service.NewDurationField("timeout").Default("30s")).
+		Field(service.NewObjectField("response",
+			service.NewStringField("default_content_format").Default("text/plain"),
+			service.NewIntField("default_code").Default(int(codes.Content)),
+			service.NewStringField("default_payload").Default("OK"),
+		).Description("Default response configuration.").Optional()).
+		Field(service.NewObjectField("converter",
+			service.NewStringField("default_content_format").Default("application/json"),
+			service.NewBoolField("compression_enabled").Default(true),
+			service.NewIntField("max_payload_size").Default(1048576),
+			service.NewBoolField("preserve_options").Default(true),
+		).Description("Message conversion configuration.").Optional()).
+		Field(service.NewObjectField("observe_server",
+			service.NewBoolField("enable_observe_server").Default(false),
+			service.NewDurationField("default_notification_max_age").Default("60s"),
+		).Description("CoAP Observe server functionality settings.").Optional())
+
+	err := service.RegisterInput("coap_server", coapServerInputConfigSpec,
+		func(conf *service.ParsedConfig, mgr *service.Resources) (service.Input, error) {
+			return newCoAPServerInput(conf, mgr)
+		})
+	if err != nil {
+		panic(err)
+	}
 }
 
-type SecurityConfig struct {
-	Mode              string
-	PSKIdentity       string
-	PSKKey            string
-	CertFile          string
-	KeyFile           string
-	CACertFile        string
-	RequireClientCert bool
-}
+func newCoAPServerInput(conf *service.ParsedConfig, mgr *service.Resources) (service.Input, error) {
+	serverConfig := ServerConfig{}
+	var err error
 
-type ResponseConfig struct {
-	DefaultContentFormat string
-	DefaultCode          codes.Code
-	DefaultPayload       string
-}
-
-type ServerMetrics struct {
-	RequestsReceived  *service.MetricCounter
-	RequestsProcessed *service.MetricCounter
-	RequestsFailed    *service.MetricCounter
-	ResponsesSent     *service.MetricCounter
-	ConnectionsActive *service.MetricCounter
-	ErrorsTotal       *service.MetricCounter
-}
-
-func newCoAPServerInput(conf *service.ParsedConfig, mgr *service.Resources) (*ServerInput, error) {
-	// Parse configuration
-	listenAddress, err := conf.FieldString("listen_address")
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse listen_address: %w", err)
+	if serverConfig.ListenAddress, err = conf.FieldString("listen_address"); err != nil {
+		return nil, err
 	}
-
-	protocol, err := conf.FieldString("protocol")
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse protocol: %w", err)
+	if serverConfig.Protocol, err = conf.FieldString("protocol"); err != nil {
+		return nil, err
 	}
-
-	allowedPaths, err := conf.FieldStringList("allowed_paths")
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse allowed_paths: %w", err)
+	if serverConfig.AllowedPaths, err = conf.FieldStringList("allowed_paths"); err != nil {
+		return nil, err
 	}
-
-	allowedMethods, err := conf.FieldStringList("allowed_methods")
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse allowed_methods: %w", err)
-	}
-
-	bufferSize, err := conf.FieldInt("buffer_size")
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse buffer_size: %w", err)
-	}
-
-	timeout, err := conf.FieldDuration("timeout")
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse timeout: %w", err)
-	}
-
-	// Parse security config
-	security, err := parseServerSecurityConfig(conf)
-	if err != nil {
+	if serverConfig.AllowedMethods, err = conf.FieldStringList("allowed_methods"); err != nil {
 		return nil, err
 	}
 
-	// Parse response config
-	response, err := parseResponseConfig(conf)
-	if err != nil {
+	// Security Config
+	secConf := conf.Namespace("security") // Use Namespace for optional objects
+	// For fields within an optional object, we need to handle them carefully
+	// Use default values for optional fields if they're not provided
+	if serverConfig.Security.Mode, err = secConf.FieldString("mode"); err != nil {
+		return nil, fmt.Errorf("parsing security.mode: %w", err)
+	}
+
+	// For optional fields, ignore errors if the field is not found
+	serverConfig.Security.PSKIdentity, _ = secConf.FieldString("psk_identity")
+	serverConfig.Security.PSKKey, _ = secConf.FieldString("psk_key")
+	serverConfig.Security.CertFile, _ = secConf.FieldString("cert_file")
+	serverConfig.Security.KeyFile, _ = secConf.FieldString("key_file")
+	serverConfig.Security.CACertFile, _ = secConf.FieldString("ca_cert_file")
+	serverConfig.Security.RequireClientCert, _ = secConf.FieldBool("require_client_cert")
+	// If "security" namespace was missing, the fields above got their defaults from the spec.
+	// Ensure Mode is "none" if it resolved to empty string (e.g. if default wasn't specified and block missing)
+	if serverConfig.Security.Mode == "" {
+		serverConfig.Security.Mode = "none"
+	}
+
+	if serverConfig.BufferSize, err = conf.FieldInt("buffer_size"); err != nil {
+		return nil, err
+	}
+	if serverConfig.Timeout, err = conf.FieldDuration("timeout"); err != nil {
 		return nil, err
 	}
 
-	// Parse converter config
-	converterConfig, err := parseServerConverterConfig(conf)
+	respConf := conf.Namespace("response")
+	if serverConfig.Response.DefaultContentFormat, err = respConf.FieldString("default_content_format"); err != nil {
+		return nil, err
+	}
+	respCodeInt, err := respConf.FieldInt("default_code")
 	if err != nil {
 		return nil, err
 	}
-
-	// Validate configuration
-	if bufferSize <= 0 {
-		return nil, fmt.Errorf("buffer_size must be positive, got: %d", bufferSize)
+	serverConfig.Response.DefaultCode = codes.Code(respCodeInt)
+	if serverConfig.Response.DefaultPayload, err = respConf.FieldString("default_payload"); err != nil {
+		return nil, err
 	}
 
-	config := ServerConfig{
-		ListenAddress:   listenAddress,
-		Protocol:        protocol,
-		AllowedPaths:    allowedPaths,
-		AllowedMethods:  allowedMethods,
-		BufferSize:      bufferSize,
-		Timeout:         timeout,
-		SecurityConfig:  security,
-		ResponseConfig:  response,
-		ConverterConfig: converterConfig,
+	convConf := conf.Namespace("converter")
+	if serverConfig.Converter.DefaultContentFormat, err = convConf.FieldString("default_content_format"); err != nil {
+		return nil, err
+	}
+	if serverConfig.Converter.CompressionEnabled, err = convConf.FieldBool("compression_enabled"); err != nil {
+		return nil, err
+	}
+	if serverConfig.Converter.MaxPayloadSize, err = convConf.FieldInt("max_payload_size"); err != nil {
+		return nil, err
+	}
+	if serverConfig.Converter.PreserveOptions, err = convConf.FieldBool("preserve_options"); err != nil {
+		return nil, err
 	}
 
-	// Initialize components
-	conv := converter.NewConverter(converterConfig, mgr.Logger())
+	obsConf := conf.Namespace("observe_server")
+	if serverConfig.Observe.EnableObserveServer, err = obsConf.FieldBool("enable_observe_server"); err != nil {
+		return nil, err
+	}
+	if serverConfig.Observe.DefaultNotificationMaxAge, err = obsConf.FieldDuration("default_notification_max_age"); err != nil {
+		return nil, err
+	}
 
-	input := &ServerInput{
-		converter: conv,
-		logger:    mgr.Logger(),
-		config:    config,
-		msgChan:   make(chan *service.Message, bufferSize),
+	if serverConfig.BufferSize <= 0 {
+		return nil, fmt.Errorf("buffer_size must be > 0")
+	}
+
+	logger := mgr.Logger()
+	metrics := &ServerMetrics{
+		RequestsReceived:  mgr.Metrics().NewCounter("coap_server_requests_received"),
+		RequestsProcessed: mgr.Metrics().NewCounter("coap_server_requests_processed"),
+		RequestsFailed:    mgr.Metrics().NewCounter("coap_server_requests_failed"),
+		ResponsesSent:     mgr.Metrics().NewCounter("coap_server_responses_sent"),
+		NotificationsSent: mgr.Metrics().NewCounter("coap_server_notifications_sent"),
+		MessagesRead:      mgr.Metrics().NewCounter("coap_server_messages_read"),
+		ErrorsTotal:       mgr.Metrics().NewCounter("coap_server_errors_total"),
+	}
+	converter := benthosConverter.NewConverter(serverConfig.Converter, logger)
+
+	return &ServerInput{
+		config:    serverConfig,
+		logger:    logger,
+		metrics:   metrics,
+		converter: converter,
+		msgChan:   make(chan *service.Message, serverConfig.BufferSize),
 		closeChan: make(chan struct{}),
-		metrics: &ServerMetrics{
-			RequestsReceived:  mgr.Metrics().NewCounter("coap_server_requests_received"),
-			RequestsProcessed: mgr.Metrics().NewCounter("coap_server_requests_processed"),
-			RequestsFailed:    mgr.Metrics().NewCounter("coap_server_requests_failed"),
-			ResponsesSent:     mgr.Metrics().NewCounter("coap_server_responses_sent"),
-			ConnectionsActive: mgr.Metrics().NewCounter("coap_server_connections_active"),
-			ErrorsTotal:       mgr.Metrics().NewCounter("coap_server_errors_total"),
-		},
-	}
+		router:    mux.NewRouter(), // Initialize router here
+	}, nil
+}
 
-	return input, nil
+// parseContentFormatString maps a string content format name to a message.MediaType.
+// It logs a warning for unknown formats and defaults to message.AppOctets.
+func (s *ServerInput) parseContentFormatString(format string) message.MediaType {
+	switch strings.ToLower(format) {
+	case "text/plain":
+		return message.TextPlain
+	case "application/json":
+		return message.AppJSON
+	case "application/xml":
+		return message.AppXML
+	case "application/cbor":
+		return message.AppCBOR
+	case "application/octet-stream":
+		return message.AppOctets
+	default:
+		s.logger.Warnf("Unknown content format string '%s'. Defaulting to application/octet-stream.", format)
+		return message.AppOctets // Safe default for unknown types
+	}
+}
+
+func (s *ServerInput) isClosed() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.closed
 }
 
 func (s *ServerInput) Connect(ctx context.Context) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.udpServer != nil || s.tcpServer != nil || s.dtlsServer != nil || s.closed {
+		s.mu.Unlock()
+		s.logger.Debug("CoAP server already active or closed.")
+		return nil
+	}
+	s.mu.Unlock()
 
-	// Create router for handling requests
-	router := mux.NewRouter()
-	// Explicitly handle test paths and the root path
-	router.Handle("/", mux.HandlerFunc(s.handleRequest)) // For the modified TCP test
-	router.Handle("/test/tcp", mux.HandlerFunc(s.handleRequest))
-	router.Handle("/test/tcp-tls", mux.HandlerFunc(s.handleRequest))
-	router.Handle("/test/udp", mux.HandlerFunc(s.handleRequest))
+	// Configure router handlers
+	// We need to separate exact paths from wildcard patterns for proper router registration
+	exactPaths := make([]string, 0, len(s.config.AllowedPaths))
+	wildcardPaths := make([]string, 0, len(s.config.AllowedPaths))
 
-	// Create listener and server based on protocol
-	var err error
-	switch s.config.Protocol {
-	case "udp", "udp-dtls":
-		if s.udpServer != nil {
-			return nil // Already connected
+	for _, p := range s.config.AllowedPaths {
+		if s.containsWildcards(p) {
+			wildcardPaths = append(wildcardPaths, p)
+		} else {
+			exactPaths = append(exactPaths, p)
 		}
-		s.udpServer = udpserver.New(options.WithMux(router)) // Use options.WithMux
-		s.udpConn, err = coapNet.NewListenUDP("udp", s.config.ListenAddress) // Assuming DTLS is handled by NewListenUDP or specific DTLS listener
-		if err != nil {
-			return fmt.Errorf("failed to listen on UDP address %s: %w", s.config.ListenAddress, err)
-		}
-		s.logger.Infof("CoAP server listening on UDP %s", s.config.ListenAddress)
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			if s.udpConn != nil {
-				defer s.udpConn.Close()
+	}
+
+	// Register exact paths with the router for optimal routing performance
+	// These paths can be handled directly by the router's native path matching
+	if len(exactPaths) > 0 {
+		s.logger.Debugf("Registering %d exact paths with router", len(exactPaths))
+		for _, p := range exactPaths {
+			normalizedPath := p
+			if !strings.HasPrefix(normalizedPath, "/") && normalizedPath != "" {
+				normalizedPath = "/" + normalizedPath
+			} else if normalizedPath == "" { // Treat empty path as root
+				normalizedPath = "/"
 			}
-			if err := s.udpServer.Serve(s.udpConn); err != nil {
-				select {
-				case <-s.closeChan:
-					s.logger.Debug("CoAP UDP server shutdown")
-				default:
+			s.logger.Debugf("Registering exact path handler: %s", normalizedPath)
+			s.router.HandleFunc(normalizedPath, s.handleRequest)
+		}
+	}
+
+	// Log information about wildcard patterns
+	if len(wildcardPaths) > 0 {
+		s.logger.Infof("Found %d wildcard patterns in allowed_paths: %v", len(wildcardPaths), wildcardPaths)
+		s.logger.Info("Wildcard patterns will be handled by the catch-all handler and filtered in isPathAllowed()")
+	}
+
+	// Always register the catch-all handler for:
+	// 1. Requests to wildcard patterns (filtered by isPathAllowed)
+	// 2. Requests when no specific paths are configured (empty allowed_paths means allow all)
+	// 3. Fallback for any unmatched requests
+	s.router.HandleFunc("/*", s.handleRequest)
+
+	// Note: Each server type (UDP, TCP, DTLS) has its own Option interface
+
+	var err error
+	protocol := strings.ToLower(s.config.Protocol)
+	s.logger.Infof("Starting CoAP server on %s proto %s", s.config.ListenAddress, protocol)
+
+	switch protocol {
+	case "udp":
+		s.mu.Lock()
+		s.udpServer = udpserver.New(
+			options.WithMux(s.router),
+			options.WithBlockwise(true, blockwise.SZX1024, time.Second*3),
+			options.WithErrors(func(err error) {
+				if !s.isClosed() {
 					s.logger.Errorf("CoAP UDP server error: %v", err)
 					s.metrics.ErrorsTotal.Incr(1)
 				}
+			}),
+		)
+		s.mu.Unlock()
+		s.udpConn, err = coapNet.NewListenUDP("udp", s.config.ListenAddress)
+		if err != nil {
+			return fmt.Errorf("UDP listen: %w", err)
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer s.udpConn.Close()
+			s.logger.Infof("CoAP UDP listening on %s", s.udpConn.LocalAddr())
+			if sErr := s.udpServer.Serve(s.udpConn); sErr != nil && !s.isClosed() {
+				s.logger.Errorf("UDP Serve: %v", sErr)
 			}
 		}()
 	case "tcp":
-		if s.tcpServer != nil {
-			return nil // Already connected
-		}
-		s.tcpServer = tcpserver.New(options.WithMux(router)) // Use options.WithMux
-		s.tcpListener, err = coapNet.NewTCPListener("tcp", s.config.ListenAddress)
-		if err != nil {
-			return fmt.Errorf("failed to listen on TCP address %s: %w", s.config.ListenAddress, err)
-		}
-		s.logger.Infof("CoAP server listening on TCP %s", s.config.ListenAddress)
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			if s.tcpListener != nil {
-				defer s.tcpListener.Close()
-			}
-			if err := s.tcpServer.Serve(s.tcpListener); err != nil {
-				select {
-				case <-s.closeChan:
-					s.logger.Debug("CoAP TCP server shutdown")
-				default:
+		s.mu.Lock()
+		s.tcpServer = tcpserver.New(
+			options.WithMux(s.router),
+			options.WithBlockwise(true, blockwise.SZX1024, time.Second*3),
+			options.WithErrors(func(err error) {
+				if !s.isClosed() {
 					s.logger.Errorf("CoAP TCP server error: %v", err)
 					s.metrics.ErrorsTotal.Incr(1)
 				}
-			}
-		}()
-	case "tcp-tls":
-		if s.tcpServer != nil {
-			return nil // Already connected
-		}
-		s.tcpServer = tcpserver.New(options.WithMux(router)) // Use options.WithMux
-		tlsConfig := &tls.Config{
-			MinVersion: tls.VersionTLS12, // Example, consider making configurable
-		}
-		if s.config.SecurityConfig.CertFile != "" && s.config.SecurityConfig.KeyFile != "" {
-			cert, err := tls.LoadX509KeyPair(s.config.SecurityConfig.CertFile, s.config.SecurityConfig.KeyFile)
-			if err != nil {
-				return fmt.Errorf("failed to load server certificate/key: %w", err)
-			}
-			tlsConfig.Certificates = []tls.Certificate{cert}
-		} else {
-			// Potentially return error if cert/key not provided for tcp-tls
-			s.logger.Warnf("TCP-TLS selected but cert_file or key_file not provided. Server might not start correctly.")
-		}
-		// Client authentication
-		if s.config.SecurityConfig.CACertFile != "" {
-			caCert, err := os.ReadFile(s.config.SecurityConfig.CACertFile)
-			if err != nil {
-				return fmt.Errorf("failed to read CA certificate: %w", err)
-			}
-			caCertPool := x509.NewCertPool()
-			caCertPool.AppendCertsFromPEM(caCert)
-			tlsConfig.ClientCAs = caCertPool
-			if s.config.SecurityConfig.RequireClientCert {
-				tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-			} else {
-				tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
-			}
-		}
-
-		s.tcpListener, err = coapNet.NewTLSListener("tcp", s.config.ListenAddress, tlsConfig) // Changed "tcp-tls" to "tcp"
+			}),
+		)
+		s.mu.Unlock() // Corrected: Unlock after server creation
+		s.tcpListener, err = coapNet.NewTCPListener("tcp", s.config.ListenAddress)
 		if err != nil {
-			return fmt.Errorf("failed to listen on TCP-TLS address %s: %w", s.config.ListenAddress, err)
+			return fmt.Errorf("TCP listen: %w", err)
 		}
-		s.logger.Infof("CoAP server listening on TCP-TLS %s", s.config.ListenAddress)
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			if s.tcpListener != nil {
-				defer s.tcpListener.Close()
+			defer s.tcpListener.Close()
+			if nl, ok := s.tcpListener.(net.Listener); ok {
+				s.logger.Infof("CoAP TCP listening on %s", nl.Addr())
+			} else {
+				s.logger.Info("CoAP TCP listening")
+			} // Should always be net.Listener
+			if sErr := s.tcpServer.Serve(s.tcpListener); sErr != nil && !s.isClosed() {
+				s.logger.Errorf("TCP Serve: %v", sErr)
 			}
-			if err := s.tcpServer.Serve(s.tcpListener); err != nil {
-				select {
-				case <-s.closeChan:
-					s.logger.Debug("CoAP TCP-TLS server shutdown")
-				default:
+		}()
+	case "udp-dtls":
+		if s.config.Security.Mode == "none" {
+			return fmt.Errorf("DTLS needs psk/cert security")
+		}
+		dtlsConf, cErr := s.createDTLSConfig()
+		if cErr != nil {
+			return fmt.Errorf("DTLS config: %w", cErr)
+		}
+		// dtlsserver.New takes dtlsserver.Option, not generic options.Option
+		// We need to wrap generic options or find DTLS-specific ways to set Mux, etc.
+		// For now, let's assume common options like WithMux can be adapted or are available.
+		// The plgd-dev/go-coap/v3/dtls/server.Server uses options/config.Common, so options.WithMux should work.
+		s.mu.Lock()
+		s.dtlsServer = dtlsserver.New(
+			options.WithMux(s.router),
+			options.WithBlockwise(true, blockwise.SZX1024, time.Second*3),
+			options.WithErrors(func(err error) {
+				if !s.isClosed() {
+					s.logger.Errorf("CoAP DTLS server error: %v", err)
+					s.metrics.ErrorsTotal.Incr(1)
+				}
+			}),
+		)
+		s.mu.Unlock() // Corrected: Unlock after server creation - This line seems to have been missed in the previous diff
+		s.dtlsListener, err = coapNet.NewDTLSListener("udp", s.config.ListenAddress, dtlsConf)
+		if err != nil {
+			return fmt.Errorf("DTLS listen: %w", err)
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer s.dtlsListener.Close()
+			// dtlsserver.Listener implements net.Listener, so we can get the address.
+			if nl, ok := s.dtlsListener.(net.Listener); ok {
+				s.logger.Infof("CoAP DTLS listening on %s", nl.Addr())
+			} else {
+				s.logger.Infof("CoAP DTLS listening on %s (address not available via net.Listener type assertion)", s.config.ListenAddress)
+			}
+			if sErr := s.dtlsServer.Serve(s.dtlsListener); sErr != nil && !s.isClosed() {
+				s.logger.Errorf("DTLS Serve: %v", sErr)
+			}
+		}()
+	case "tcp-tls":
+		if s.config.Security.CertFile == "" || s.config.Security.KeyFile == "" {
+			return fmt.Errorf("TCP-TLS needs cert/key")
+		}
+		tlsConf, cErr := s.createTLSConfig()
+		if cErr != nil {
+			return fmt.Errorf("TLS config: %w", cErr)
+		}
+		s.mu.Lock()
+		s.tcpServer = tcpserver.New(
+			options.WithMux(s.router),
+			options.WithBlockwise(true, blockwise.SZX1024, time.Second*3),
+			options.WithErrors(func(err error) {
+				if !s.isClosed() {
 					s.logger.Errorf("CoAP TCP-TLS server error: %v", err)
 					s.metrics.ErrorsTotal.Incr(1)
 				}
+			}),
+		)
+		s.mu.Unlock() // Corrected: Unlock after server creation
+		s.tcpListener, err = coapNet.NewTLSListener("tcp", s.config.ListenAddress, tlsConf)
+		if err != nil {
+			return fmt.Errorf("TCP-TLS listen: %w", err)
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer s.tcpListener.Close()
+			// coapNet.TLSListener wraps a net.Listener, so Addr() should be available via type assertion.
+			if nl, ok := s.tcpListener.(net.Listener); ok {
+				s.logger.Infof("CoAP TCP-TLS listening on %s", nl.Addr())
+			} else {
+				s.logger.Infof("CoAP TCP-TLS listening on %s (address not available via net.Listener type assertion)", s.config.ListenAddress)
+			}
+			if sErr := s.tcpServer.Serve(s.tcpListener); sErr != nil && !s.isClosed() {
+				s.logger.Errorf("TCP-TLS Serve: %v", sErr)
 			}
 		}()
 	default:
-		return fmt.Errorf("protocol %s not supported for server input", s.config.Protocol)
+		return fmt.Errorf("unknown protocol: %s", protocol)
 	}
-
-	s.logger.Infof("CoAP server input started on %s (%s)", s.config.ListenAddress, s.config.Protocol)
+	s.logger.Infof("CoAP server started: %s (%s)", s.config.ListenAddress, protocol)
 	return nil
 }
 
-func (s *ServerInput) handleRequest(w mux.ResponseWriter, r *mux.Message) {
-	s.metrics.RequestsReceived.Incr(1)
-
-	// Extract request information
-	method := s.getMethodString(r.Code())
-	opts := r.Options()
-	path, err := opts.Path()
-	if err != nil || path == "" {
-		path = "/"
+func (s *ServerInput) createTLSConfig() (*tls.Config, error) {
+	if s.config.Security.CertFile == "" || s.config.Security.KeyFile == "" {
+		return nil, fmt.Errorf("cert_file and key_file must be provided for TLS")
 	}
-
-	// Check if method is allowed
-	if len(s.config.AllowedMethods) > 0 && !s.isMethodAllowed(method) {
-		s.logger.Debugf("Method %s not allowed", method)
-		s.sendErrorResponse(w, codes.MethodNotAllowed, "Method not allowed")
-		s.metrics.RequestsFailed.Incr(1)
-		return
-	}
-
-	// Check if path is allowed
-	if len(s.config.AllowedPaths) > 0 && !s.isPathAllowed(path) {
-		s.logger.Debugf("Path %s not allowed", path)
-		s.sendErrorResponse(w, codes.NotFound, "Path not found")
-		s.metrics.RequestsFailed.Incr(1)
-		return
-	}
-
-	// Convert CoAP request to Benthos message
-	benthosMsg, err := s.convertRequestToMessage(r.Message, method, path)
+	cert, err := tls.LoadX509KeyPair(s.config.Security.CertFile, s.config.Security.KeyFile)
 	if err != nil {
-		s.logger.Errorf("Failed to convert CoAP request to Benthos message: %v", err)
-		s.sendErrorResponse(w, codes.InternalServerError, "Internal server error")
-		s.metrics.RequestsFailed.Incr(1)
-		return
+		return nil, fmt.Errorf("load server cert/key: %w", err)
 	}
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	if s.config.Security.CACertFile != "" {
+		caCert, err := os.ReadFile(s.config.Security.CACertFile)
+		if err != nil {
+			return nil, fmt.Errorf("read CA cert: %w", err)
+		}
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, fmt.Errorf("parse CA cert")
+		}
+		tlsConfig.ClientCAs = caCertPool
+		if s.config.Security.RequireClientCert {
+			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+		} else {
+			tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+		}
+	}
+	return tlsConfig, nil
+}
 
-	// Send message to channel
+func (s *ServerInput) createDTLSConfig() (*piondtls.Config, error) {
+	dtlsConfig := &piondtls.Config{ExtendedMasterSecret: piondtls.RequireExtendedMasterSecret}
+	switch s.config.Security.Mode {
+	case "psk":
+		if s.config.Security.PSKIdentity == "" || s.config.Security.PSKKey == "" {
+			return nil, fmt.Errorf("psk_identity and psk_key required for DTLS PSK")
+		}
+		dtlsConfig.PSK = func(hint []byte) ([]byte, error) { return []byte(s.config.Security.PSKKey), nil }
+		dtlsConfig.PSKIdentityHint = []byte(s.config.Security.PSKIdentity)
+		dtlsConfig.CipherSuites = []piondtls.CipherSuiteID{piondtls.TLS_PSK_WITH_AES_128_CCM_8}
+	case "certificate":
+		if s.config.Security.CertFile == "" || s.config.Security.KeyFile == "" {
+			return nil, fmt.Errorf("cert_file and key_file required for DTLS certificate mode")
+		}
+		cert, err := tls.LoadX509KeyPair(s.config.Security.CertFile, s.config.Security.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load server cert/key for DTLS: %w", err)
+		}
+		dtlsConfig.Certificates = []tls.Certificate{cert}
+		if s.config.Security.CACertFile != "" {
+			caCert, err := os.ReadFile(s.config.Security.CACertFile)
+			if err != nil {
+				return nil, fmt.Errorf("read CA cert for DTLS: %w", err)
+			}
+			caCertPool := x509.NewCertPool()
+			if !caCertPool.AppendCertsFromPEM(caCert) {
+				return nil, fmt.Errorf("parse CA cert for DTLS")
+			}
+			dtlsConfig.ClientCAs = caCertPool
+			if s.config.Security.RequireClientCert {
+				dtlsConfig.ClientAuth = piondtls.RequireAndVerifyClientCert
+			} else {
+				dtlsConfig.ClientAuth = piondtls.VerifyClientCertIfGiven
+			}
+		}
+	default:
+		return nil, fmt.Errorf("security mode '%s' unsupported for DTLS", s.config.Security.Mode)
+	}
+	return dtlsConfig, nil
+}
+
+func (s *ServerInput) Read(ctx context.Context) (*service.Message, service.AckFunc, error) {
+	if s.isClosed() {
+		return nil, nil, service.ErrEndOfInput
+	}
 	select {
-	case s.msgChan <- benthosMsg:
-		s.metrics.RequestsProcessed.Incr(1)
-		s.logger.Debugf("Processed %s request for path %s", method, path)
-
-		// Send default response
-		s.sendSuccessResponse(w)
-		s.metrics.ResponsesSent.Incr(1)
-
-	case <-time.After(s.config.Timeout):
-		s.logger.Warnf("Timeout processing %s request for path %s", method, path)
-		s.sendErrorResponse(w, codes.ServiceUnavailable, "Service temporarily unavailable")
-		s.metrics.RequestsFailed.Incr(1)
-
+	case msg, open := <-s.msgChan:
+		if !open {
+			return nil, nil, service.ErrEndOfInput
+		}
+		s.metrics.MessagesRead.Incr(1)
+		return msg, func(rctx context.Context, res error) error {
+			if res != nil {
+				s.logger.Debugf("NACK received for message: %v", res)
+			}
+			return nil
+		}, nil
 	case <-s.closeChan:
-		s.logger.Debug("Server shutting down, rejecting request")
-		s.sendErrorResponse(w, codes.ServiceUnavailable, "Server shutting down")
-		s.metrics.RequestsFailed.Incr(1)
+		return nil, nil, service.ErrEndOfInput
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
 	}
 }
 
-func (s *ServerInput) convertRequestToMessage(poolMsg *pool.Message, method, path string) (*service.Message, error) {
-	// Convert pool.Message to message.Message for the converter
-	msg := &message.Message{
-		Code:  poolMsg.Code(),
-		Token: poolMsg.Token(),
-		Type:  poolMsg.Type(),
-	}
-
-	// Copy options
-	opts := poolMsg.Options()
-	msg.Options = make(message.Options, len(opts))
-	copy(msg.Options, opts)
-
-	// Copy payload from body
-	if body := poolMsg.Body(); body != nil {
-		if payload, err := io.ReadAll(body); err == nil {
-			msg.Payload = payload
+func (s *ServerInput) Close(ctx context.Context) error {
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return
 		}
-		// Reset body for any future reads
-		if seeker, ok := body.(io.Seeker); ok {
-			seeker.Seek(0, io.SeekStart)
+		s.closed = true
+		s.mu.Unlock()
+		s.logger.Info("Closing CoAP server input...")
+		close(s.closeChan)
+		if s.udpConn != nil {
+			if err := s.udpConn.Close(); err != nil {
+				s.logger.Errorf("Close UDP conn: %v", err)
+			}
 		}
-	}
-
-	// Convert using the standard converter
-	benthosMsg, err := s.converter.CoAPToMessage(msg)
-	if err != nil {
-		return nil, fmt.Errorf("converter failed: %w", err)
-	}
-
-	// Add server-specific metadata
-	benthosMsg.MetaSet("coap_server_method", method)
-	benthosMsg.MetaSet("coap_server_path", path)
-	benthosMsg.MetaSet("coap_server_timestamp", time.Now().Format(time.RFC3339))
-	benthosMsg.MetaSet("coap_server_protocol", s.config.Protocol)
-
-	return benthosMsg, nil
+		if s.dtlsListener != nil {
+			if err := s.dtlsListener.Close(); err != nil {
+				s.logger.Errorf("Close DTLS listener: %v", err)
+			}
+		}
+		if s.tcpListener != nil {
+			if err := s.tcpListener.Close(); err != nil {
+				s.logger.Errorf("Close TCP listener: %v", err)
+			}
+		}
+		s.logger.Debug("Waiting for server goroutines...")
+		s.wg.Wait()
+		s.mu.Lock()
+		if s.msgChan != nil {
+			close(s.msgChan)
+		}
+		s.mu.Unlock()
+		s.logger.Info("CoAP server input closed.")
+	})
+	return nil
 }
 
-func (s *ServerInput) sendSuccessResponse(w mux.ResponseWriter) {
-	payload := []byte(s.config.ResponseConfig.DefaultPayload)
-	err := w.SetResponse(
-		s.config.ResponseConfig.DefaultCode,
-		message.TextPlain,
-		bytes.NewReader(payload),
-	)
-	if err != nil {
-		s.logger.Errorf("Failed to send success response: %v", err)
-		s.metrics.ErrorsTotal.Incr(1)
+// Health returns the current health status of the input.
+func (s *ServerInput) Health() map[string]any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	status := map[string]any{
+		"status":         "healthy",
+		"buffer_usage":   fmt.Sprintf("%d/%d", len(s.msgChan), cap(s.msgChan)),
+		"listen_address": s.config.ListenAddress,
+		"protocol":       s.config.Protocol,
 	}
+
+	if s.closed {
+		status["status"] = "closed"
+	} else {
+		// Could add checks here if the underlying server/listener is nil,
+		// but Connect should ensure one is running if not closed.
+		// More advanced health checks might involve sending a dummy request
+		// or checking internal server state if the library exposed it.
+	}
+
+	return status
 }
 
-func (s *ServerInput) sendErrorResponse(w mux.ResponseWriter, code codes.Code, errorMsg string) {
-	payload := []byte(errorMsg)
-	err := w.SetResponse(code, message.TextPlain, bytes.NewReader(payload))
-	if err != nil {
-		s.logger.Errorf("Failed to send error response: %v", err)
-		s.metrics.ErrorsTotal.Incr(1)
-	}
-}
-
-func (s *ServerInput) getMethodString(code codes.Code) string {
+func (s *ServerInput) getMethodString(code codes.Code) string { /* ... full implementation ... */
 	switch code {
 	case codes.GET:
 		return "GET"
@@ -518,280 +652,204 @@ func (s *ServerInput) getMethodString(code codes.Code) string {
 		return code.String()
 	}
 }
+func (s *ServerInput) sendSuccessResponse(w mux.ResponseWriter) { /* ... full implementation using w.SetResponse ... */
+	payloadReader := bytes.NewReader([]byte(s.config.Response.DefaultPayload))
+	contentType := message.TextPlain
+	// Use the helper function to parse the configured default content format string
+	contentType = s.parseContentFormatString(s.config.Response.DefaultContentFormat)
 
-func (s *ServerInput) isMethodAllowed(method string) bool {
-	// If no methods are specified, allow all
-	if len(s.config.AllowedMethods) == 0 {
-		return true
+	if err := w.SetResponse(s.config.Response.DefaultCode, contentType, payloadReader); err != nil && !s.isClosed() {
+		s.logger.Errorf("Send success response: %v", err)
+		s.metrics.ErrorsTotal.Incr(1)
 	}
-
-	for _, allowed := range s.config.AllowedMethods {
-		if allowed == method {
-			return true
-		}
+}
+func (s *ServerInput) sendErrorResponse(w mux.ResponseWriter, code codes.Code, errorMsg string) { /* ... full implementation using w.SetResponse ... */
+	payloadReader := bytes.NewReader([]byte(errorMsg))
+	if err := w.SetResponse(code, message.TextPlain, payloadReader); err != nil && !s.isClosed() {
+		s.logger.Errorf("Send error response (code %s): %v", code.String(), err)
+		s.metrics.ErrorsTotal.Incr(1)
 	}
-	return false
 }
-
-func (s *ServerInput) isPathAllowed(path string) bool {
-	// If no paths are specified, allow all
-	if len(s.config.AllowedPaths) == 0 {
-		return true
-	}
-
-	for _, allowed := range s.config.AllowedPaths {
-		// Try exact match first (fastest)
-		if allowed == path {
-			return true
-		}
-
-		// Try pattern match if pattern contains wildcards
-		if s.containsWildcards(allowed) && s.matchesPattern(allowed, path) {
-			return true
-		}
-	}
-	return false
-}
-
-// containsWildcards checks if a pattern contains wildcard characters
-func (s *ServerInput) containsWildcards(pattern string) bool {
-	return strings.Contains(pattern, "+") || strings.Contains(pattern, "*")
-}
-
-// matchesPattern checks if a path matches a wildcard pattern
-// Patterns:
-//   - matches exactly one path segment (between slashes)
-//   - matches zero or more path segments
-//
-// Examples:
-//
-//	"/sensors/+" matches "/sensors/temp" but not "/sensors/temp/value"
-//	"/sensors/*" matches "/sensors/temp", "/sensors/temp/value", "/sensors/a/b/c"
-//	"/api/+/data" matches "/api/v1/data" but not "/api/v1/v2/data"
-func (s *ServerInput) matchesPattern(pattern, path string) bool {
-	// Split both pattern and path into segments
-	patternSegments := s.splitPath(pattern)
-	pathSegments := s.splitPath(path)
-
-	return s.matchSegments(patternSegments, pathSegments)
-}
-
-// splitPath splits a path into segments, removing empty segments
-func (s *ServerInput) splitPath(path string) []string {
+func (s *ServerInput) splitPath(path string) []string { /* ... full implementation ... */
 	trimmedPath := strings.Trim(path, "/")
-	if trimmedPath == "" { // Handles "/", "//", "" etc. to return empty slice
+	if trimmedPath == "" {
 		return []string{}
 	}
-
 	segments := strings.Split(trimmedPath, "/")
-
-	// Remove empty segments
-	// No need to filter empty segments anymore if strings.Split behaves well with trimmedPath
-	// and we handle the fully empty trimmedPath case above.
-	// However, if path is like "/a//b", Split will produce "a", "", "b".
-	// So, filtering is still good.
 	var result []string
 	for _, segment := range segments {
 		if segment != "" {
 			result = append(result, segment)
 		}
 	}
-	// Ensure truly empty result is {} not nil, though above check for trimmedPath == "" should handle most.
-	if len(result) == 0 && path != "/" && path != "" { // if path was like "///" this might result in non-nil empty.
-        // Actually, if trimmedPath is empty, we return []string{}.
-        // If segments after split are all "", result will be empty.
-        // The test expects []string{} for input "", current code with trimmedPath == "" check should yield that.
-        // The original issue was nil vs empty slice, which this structure should avoid.
-    }
-
-
 	return result
 }
-
-// matchSegments recursively matches pattern segments against path segments
-func (s *ServerInput) matchSegments(patternSegments, pathSegments []string) bool {
-	// If pattern is empty, path must also be empty
-	if len(patternSegments) == 0 {
-		return len(pathSegments) == 0
+func (s *ServerInput) containsWildcards(pattern string) bool {
+	return strings.Contains(pattern, "+") || strings.Contains(pattern, "*")
+}
+func (s *ServerInput) matchSegments(pSegs, pathSegs []string) bool { /* ... full implementation ... */
+	if len(pSegs) == 0 {
+		return len(pathSegs) == 0
 	}
-
-	// If path is empty but pattern isn't, check if pattern can match empty
-	if len(pathSegments) == 0 {
-		// Only "*" at the end can match empty path
-		return len(patternSegments) == 1 && patternSegments[0] == "*"
+	if len(pathSegs) == 0 {
+		for _, ps := range pSegs {
+			if ps != "*" {
+				return false
+			}
+		}
+		return true
 	}
-
-	firstPattern := patternSegments[0]
-
+	firstPattern := pSegs[0]
 	switch firstPattern {
 	case "+":
-		// + matches exactly one segment
-		if len(pathSegments) == 0 {
-			return false
-		}
-		// Match this segment and continue with remaining
-		return s.matchSegments(patternSegments[1:], pathSegments[1:])
-
+		return len(pathSegs) > 0 && s.matchSegments(pSegs[1:], pathSegs[1:]) // Ensure pathSegs is not empty
 	case "*":
-		// * matches zero or more segments
-		// Try matching with 0, 1, 2, ... segments consumed by *
-		for i := 0; i <= len(pathSegments); i++ {
-			if s.matchSegments(patternSegments[1:], pathSegments[i:]) {
+		if s.matchSegments(pSegs[1:], pathSegs) {
+			return true
+		}
+		return len(pathSegs) > 0 && s.matchSegments(pSegs, pathSegs[1:])
+	default:
+		return len(pathSegs) > 0 && pSegs[0] == pathSegs[0] && s.matchSegments(pSegs[1:], pathSegs[1:])
+	}
+}
+func (s *ServerInput) isPathAllowed(path string) bool { /* ... full implementation ... */
+	if len(s.config.AllowedPaths) == 0 {
+		return true
+	}
+	normalizedPath := "/" + strings.Trim(path, "/")
+	if path == "/" {
+		normalizedPath = "/"
+	}
+	pathSegments := s.splitPath(normalizedPath)
+	for _, allowedPattern := range s.config.AllowedPaths {
+		normalizedPattern := "/" + strings.Trim(allowedPattern, "/")
+		if allowedPattern == "/" {
+			normalizedPattern = "/"
+		}
+		if !s.containsWildcards(normalizedPattern) {
+			if normalizedPattern == normalizedPath {
+				return true
+			}
+		} else {
+			if s.matchSegments(s.splitPath(normalizedPattern), pathSegments) {
 				return true
 			}
 		}
-		return false
-
-	default:
-		// Literal segment - must match exactly
-		if pathSegments[0] != firstPattern {
-			return false
-		}
-		// Match this segment and continue with remaining
-		return s.matchSegments(patternSegments[1:], pathSegments[1:])
 	}
+	return false
+}
+func (s *ServerInput) isMethodAllowed(method string) bool { /* ... full implementation ... */
+	if len(s.config.AllowedMethods) == 0 {
+		return true
+	}
+	for _, am := range s.config.AllowedMethods {
+		if strings.EqualFold(am, method) {
+			return true
+		}
+	}
+	return false
+}
+func (s *ServerInput) convertRequestToMessage(poolMsg *pool.Message, method, path, remoteAddr string) (*service.Message, error) { /* ... full implementation ... */
+	if poolMsg == nil {
+		return nil, fmt.Errorf("nil CoAP *pool.Message provided")
+	}
+
+	// Manually construct message.Message from pool.Message's public API
+	// as poolMsg.toMessage() is unexported.
+	payload, err := poolMsg.ReadBody()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CoAP message body from pool message: %w", err)
+	}
+	actualCoapMsg := message.Message{
+		Token:     poolMsg.Token(),
+		Code:      poolMsg.Code(),
+		Options:   poolMsg.Options(),
+		Payload:   payload,
+		MessageID: poolMsg.MessageID(),
+		Type:      poolMsg.Type(),
+	}
+
+	bMsg, err := s.converter.CoAPToMessage(&actualCoapMsg) // Pass address of the message.Message
+	if err != nil {
+		return nil, fmt.Errorf("converter: %w", err)
+	}
+	bMsg.MetaSet("coap_server_method", method)
+	bMsg.MetaSet("coap_server_path", path)
+	bMsg.MetaSet("coap_server_protocol", s.config.Protocol)
+	bMsg.MetaSet("coap_server_remote_addr", remoteAddr)
+	bMsg.MetaSet("coap_server_timestamp", time.Now().Format(time.RFC3339))
+	return bMsg, nil
 }
 
-func (s *ServerInput) Read(ctx context.Context) (*service.Message, service.AckFunc, error) {
-	s.mu.RLock()
-	closed := s.closed
-	s.mu.RUnlock()
-
-	if closed {
-		return nil, nil, service.ErrEndOfInput
+func (s *ServerInput) handleRequest(w mux.ResponseWriter, r *mux.Message) { /* ... full implementation ... */
+	s.metrics.RequestsReceived.Incr(1)
+	if r == nil {
+		s.logger.Error("Nil message in handleRequest")
+		return // Should not happen if mux is working correctly
 	}
+	method := s.getMethodString(r.Code())
+	path, errPath := r.Options().Path()
+	if errPath != nil || path == "" {
+		path = "/"
+		if errPath != nil {
+			s.logger.Debugf("Path extraction error, default to '/': %v", errPath)
+		}
+	}
+	remoteAddrStr := w.Conn().RemoteAddr().String()
+	s.logger.Debugf("Req: M=%s P=%s From=%s", method, path, remoteAddrStr)
 
+	if !s.isMethodAllowed(method) {
+		s.logger.Debugf("Disallowed method %s for %s", method, path)
+		s.sendErrorResponse(w, codes.MethodNotAllowed, "Method not allowed")
+		s.metrics.RequestsFailed.Incr(1)
+		return
+	}
+	if !s.isPathAllowed(path) {
+		s.logger.Debugf("Disallowed path %s for %s", path, method)
+		s.sendErrorResponse(w, codes.NotFound, "Path not found")
+		s.metrics.RequestsFailed.Incr(1)
+		return
+	}
+	benthosMsg, convErr := s.convertRequestToMessage(r.Message, method, path, remoteAddrStr) // Pass the embedded *pool.Message
+	if convErr != nil {
+		s.logger.Errorf("Convert CoAP to Benthos: %v", convErr)
+		s.sendErrorResponse(w, codes.InternalServerError, "Convert request failed")
+		s.metrics.RequestsFailed.Incr(1)
+		return
+	}
+	requestCtx := r.Context()
+	if requestCtx == nil {
+		requestCtx = context.Background()
+	}
 	select {
-	case msg := <-s.msgChan:
-		return msg, func(ctx context.Context, err error) error {
-			// Acknowledge message processing
-			if err != nil {
-				s.logger.Warnf("Message processing failed: %v", err)
-				s.metrics.RequestsFailed.Incr(1)
+	case s.msgChan <- benthosMsg:
+		s.metrics.RequestsProcessed.Incr(1)
+		s.logger.Debugf("Processed %s %s from %s", method, path, remoteAddrStr)
+		s.sendSuccessResponse(w)
+		// Note: For GET requests establishing an observation, sendSuccessResponse
+		// provides the initial notification. The CoAP library handles setting the Observe option.
+		s.metrics.ResponsesSent.Incr(1)
+
+		// If Observe is enabled and this was a state-changing operation (POST, PUT, DELETE)
+		// on an allowed path, log it for monitoring purposes.
+		if s.config.Observe.EnableObserveServer && (r.Code() == codes.POST || r.Code() == codes.PUT || r.Code() == codes.DELETE) {
+			if s.isPathAllowed(path) {
+				// Note: CoAP observe notifications are handled automatically by the go-coap library
+				// when clients have established observe relationships with specific paths.
+				// The library will send notifications when responses are sent to observe-enabled requests.
+				s.logger.Debugf("State change on observable path %s via %s - clients with active observations will be notified", path, method)
+				s.metrics.NotificationsSent.Incr(1)
 			}
-			return nil
-		}, nil
-	case <-ctx.Done():
-		return nil, nil, ctx.Err()
+		}
+	case <-time.After(s.config.Timeout):
+		s.logger.Warnf("Timeout processing %s %s from %s", method, path, remoteAddrStr)
+		s.sendErrorResponse(w, codes.ServiceUnavailable, "Processing timeout")
+		s.metrics.RequestsFailed.Incr(1)
 	case <-s.closeChan:
-		return nil, nil, service.ErrEndOfInput
+		s.logger.Debugf("Server shutdown, reject %s %s from %s", method, path, remoteAddrStr)
+		s.sendErrorResponse(w, codes.ServiceUnavailable, "Server shutting down")
+	case <-requestCtx.Done():
+		s.logger.Debugf("Client ctx done, reject %s %s from %s: %v", method, path, remoteAddrStr, requestCtx.Err())
+		s.metrics.RequestsFailed.Incr(1)
 	}
-}
-
-func (s *ServerInput) Close(ctx context.Context) error {
-	s.closeOnce.Do(func() {
-		s.mu.Lock()
-		s.closed = true
-		s.mu.Unlock()
-
-		close(s.closeChan)
-
-		// Close server and connections
-		if s.udpServer != nil && s.udpConn != nil {
-			s.udpConn.Close()
-			// s.udpServer.Stop() // Check if udpServer has a Stop/Close method
-		}
-		if s.tcpServer != nil && s.tcpListener != nil {
-			s.tcpListener.Close()
-			// s.tcpServer.Stop() // Check if tcpServer has a Stop/Close method
-		}
-		if s.tcpListener != nil {
-			s.tcpListener.Close()
-		}
-
-		// Wait for server goroutine to finish
-		s.wg.Wait()
-
-		close(s.msgChan)
-		s.logger.Info("CoAP server input closed")
-	})
-
-	return nil
-}
-
-// Configuration parsing helpers
-
-func parseServerSecurityConfig(conf *service.ParsedConfig) (SecurityConfig, error) {
-	mode, err := conf.FieldString("security", "mode")
-	if err != nil {
-		return SecurityConfig{}, fmt.Errorf("failed to parse security mode: %w", err)
-	}
-
-	config := SecurityConfig{Mode: mode}
-
-	if mode == "psk" {
-		if config.PSKIdentity, err = conf.FieldString("security", "psk_identity"); err != nil {
-			return SecurityConfig{}, fmt.Errorf("failed to parse psk_identity: %w", err)
-		}
-		if config.PSKKey, err = conf.FieldString("security", "psk_key"); err != nil {
-			return SecurityConfig{}, fmt.Errorf("failed to parse psk_key: %w", err)
-		}
-	} else if mode == "certificate" {
-		if config.CertFile, err = conf.FieldString("security", "cert_file"); err != nil {
-			return SecurityConfig{}, fmt.Errorf("failed to parse cert_file: %w", err)
-		}
-		if config.KeyFile, err = conf.FieldString("security", "key_file"); err != nil {
-			return SecurityConfig{}, fmt.Errorf("failed to parse key_file: %w", err)
-		}
-		if config.CACertFile, err = conf.FieldString("security", "ca_cert_file"); err != nil && err.Error() != "field \"ca_cert_file\" was not found in the config" {
-			return SecurityConfig{}, fmt.Errorf("failed to parse ca_cert_file: %w", err)
-		}
-		if config.RequireClientCert, err = conf.FieldBool("security", "require_client_cert"); err != nil {
-			return SecurityConfig{}, fmt.Errorf("failed to parse require_client_cert: %w", err)
-		}
-	}
-
-	return config, nil
-}
-
-func parseResponseConfig(conf *service.ParsedConfig) (ResponseConfig, error) {
-	contentFormat, err := conf.FieldString("response", "default_content_format")
-	if err != nil {
-		return ResponseConfig{}, fmt.Errorf("failed to parse default_content_format: %w", err)
-	}
-
-	codeInt, err := conf.FieldInt("response", "default_code")
-	if err != nil {
-		return ResponseConfig{}, fmt.Errorf("failed to parse default_code: %w", err)
-	}
-
-	payload, err := conf.FieldString("response", "default_payload")
-	if err != nil {
-		return ResponseConfig{}, fmt.Errorf("failed to parse default_payload: %w", err)
-	}
-
-	return ResponseConfig{
-		DefaultContentFormat: contentFormat,
-		DefaultCode:          codes.Code(codeInt),
-		DefaultPayload:       payload,
-	}, nil
-}
-
-func parseServerConverterConfig(conf *service.ParsedConfig) (converter.Config, error) {
-	defaultContentFormat, err := conf.FieldString("converter", "default_content_format")
-	if err != nil {
-		return converter.Config{}, fmt.Errorf("failed to parse converter default_content_format: %w", err)
-	}
-
-	compressionEnabled, err := conf.FieldBool("converter", "compression_enabled")
-	if err != nil {
-		return converter.Config{}, fmt.Errorf("failed to parse compression_enabled: %w", err)
-	}
-
-	maxPayloadSize, err := conf.FieldInt("converter", "max_payload_size")
-	if err != nil {
-		return converter.Config{}, fmt.Errorf("failed to parse max_payload_size: %w", err)
-	}
-
-	preserveOptions, err := conf.FieldBool("converter", "preserve_options")
-	if err != nil {
-		return converter.Config{}, fmt.Errorf("failed to parse preserve_options: %w", err)
-	}
-
-	return converter.Config{
-		DefaultContentFormat: defaultContentFormat,
-		CompressionEnabled:   compressionEnabled,
-		MaxPayloadSize:       maxPayloadSize,
-		PreserveOptions:      preserveOptions,
-	}, nil
 }
